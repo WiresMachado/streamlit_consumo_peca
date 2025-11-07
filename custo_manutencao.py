@@ -38,6 +38,12 @@ def init_session_state():
 
         "filtro_familia_resumo": "Todos",
         "escopo_resumo": "Apenas chassi selecionado",
+
+        # Persistência dos ajustes por Código
+        "ajustes_pecas": {},   # { "00001234": {"hect": float, "prop": int}, ... }
+
+        # Assinatura do processamento para evitar reconstrução desnecessária
+        "assinatura_processamento": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -90,61 +96,40 @@ def format_hectare_original(v):
 
 
 # ------------------------------------------------------------
-# HIGIENIZAÇÕES de entrada (onde moram os “×3” escondidos)
+# HIGIENIZAÇÕES
 # ------------------------------------------------------------
 
 def higienizar_pecas(df_pecas):
     df = df_pecas.copy()
     if "Código" in df.columns:
         df["Código"] = df["Código"].apply(format_codigo)
-    # Se sua Tabela Peças tiver Modelo, deixe só o do modelo selecionado mais à frente
-    # Aqui não dedup por segurança (pode haver códigos iguais com descrições diferentes em marcas distintas)
     return df
 
 
 def higienizar_custos(df_custos):
-    """
-    Normaliza código e reduz para 1 linha por Código (mantém o último custo válido).
-    Isso evita replicações no merge (a principal fonte de 'triplicar').
-    """
     df = df_custos.copy()
-
-    # Normaliza código
     if "Código" in df.columns:
         df["Código"] = df["Código"].apply(format_codigo)
     else:
         raise ValueError("Tabela Custos precisa ter a coluna 'Código'.")
-
-    # Custo numérico
     if "Custo" not in df.columns:
         raise ValueError("Tabela Custos precisa ter a coluna 'Custo'.")
     df["Custo"] = pd.to_numeric(df["Custo"], errors="coerce")
-
-    # Remove linhas sem código ou sem custo
     df = df.dropna(subset=["Código", "Custo"])
-
-    # Mantém APENAS 1 custo por código: prioriza a última ocorrência não-nula
-    # (se quiser, troque por 'first' ou por média)
     df = df.sort_index().drop_duplicates(subset=["Código"], keep="last").reset_index(drop=True)
-
     return df
 
 
 def higienizar_maquinas(df_maquinas):
     dfm = df_maquinas.copy()
-
     for col in ["Modelo", "Chassi"]:
         if col in dfm.columns:
             dfm[col] = dfm[col].astype(str).str.strip()
-
     for col in ["Linhas", "Espaçamento", "Ano"]:
         if col in dfm.columns:
             dfm[col] = pd.to_numeric(dfm[col], errors="coerce")
-
-    # Remove duplicatas exatas por Modelo+Chassi
     if set(["Modelo", "Chassi"]).issubset(dfm.columns):
         dfm = dfm.drop_duplicates(subset=["Modelo", "Chassi"], keep="first")
-
     return dfm
 
 
@@ -251,46 +236,66 @@ def _quantidade_recomendada_uma_maquina(row, resumo_maquina_ref):
     return qtd_rec
 
 
+def _reaplicar_ajustes(df):
+    """
+    Reaplica ajustes persistidos em st.session_state['ajustes_pecas'] por Código.
+    Usa sempre o Código normalizado (format_codigo) como chave.
+    """
+    ajustes = st.session_state.get("ajustes_pecas", {})
+    if not isinstance(ajustes, dict) or df.empty:
+        return df
+
+    # Garante Código como string normalizada
+    df["Código"] = df["Código"].apply(format_codigo)
+
+    for cod, vals in ajustes.items():
+        cod_norm = format_codigo(cod)
+        m = df["Código"] == cod_norm
+        if not m.any():
+            continue
+        if isinstance(vals, dict):
+            if "hect" in vals and vals["hect"] is not None:
+                df.loc[m, "hectare_proporcao_efetivo"] = float(vals["hect"])
+            if "prop" in vals and vals["prop"] is not None:
+                df.loc[m, "proporcao_troca_%"] = int(vals["prop"])
+    return df
+
+
 def construir_df_pecas(df_pecas, df_custos, resumo_maquina_ref, modo_operacao):
     if df_pecas is None or df_custos is None or df_pecas.empty:
         return pd.DataFrame()
 
-    # ⚙️ NORMALIZAÇÕES ANTES DO MERGE (evita replicações)
     dfp = higienizar_pecas(df_pecas)
     dfc = higienizar_custos(df_custos)
 
-    # (opcional) filtra por modelo se existir essa coluna em Peças
     modelo_sel = st.session_state.get("modelo_selecionado")
     if "Modelo" in dfp.columns and modelo_sel:
         dfp = dfp[dfp["Modelo"] == modelo_sel].copy()
 
-    # Remove duplicatas por Código em Peças (defensivo)
     if "Código" in dfp.columns:
         dfp = dfp.drop_duplicates(subset=["Código"], keep="first")
 
-    # Merge 1-para-1 garantido por 'higienizar_custos'
     df = dfp.merge(dfc[["Código", "Custo"]], on="Código", how="left")
 
-    # Vida útil ajustada pelo modo
+    # Inicial
     df["hectare_proporcao_efetivo"] = df["Hectare/Proporção"].apply(
         lambda x: aplicar_modo_operacao(x, st.session_state["modo_operacao"])
     )
+    df["proporcao_troca_%"] = 100.0
 
-    # % de troca padrão
-    df["proporcao_troca_%"] = 50.0
-
-    # Custos base
     df["custo_unitario"] = df["Custo"]
     df["custo_total_base"] = df["Qtd/Proporção"] * df["custo_unitario"]
 
-    # Quantidade e custo planejados (por máquina ref)
+    # Reaplica os ajustes persistidos (CHAVE!)
+    df = _reaplicar_ajustes(df)
+
+    # Recalcula quantidade e custo planejado (por máquina ref)
     df["qtd_recomendada"] = df.apply(
         lambda r: _quantidade_recomendada_uma_maquina(r, resumo_maquina_ref),
         axis=1
     )
     df["custo_planejado_item"] = df["qtd_recomendada"] * df["custo_unitario"]
 
-    # 🔒 Dedup duro pós-cálculo
     dedup_cols = ["Código","Descrição","Família","Proporção","Qtd/Proporção",
                   "hectare_proporcao_efetivo","proporcao_troca_%","custo_unitario"]
     dedup_cols = [c for c in dedup_cols if c in df.columns]
@@ -304,7 +309,9 @@ def recalcular_pecas_pos_ajuste(df_pecas_proc, resumo_maquina_ref):
         return df_pecas_proc
     df = df_pecas_proc.copy()
 
-    # 🔒 dedup antes do recálculo
+    # Reaplica ajustes no recálculo (garantia extra)
+    df = _reaplicar_ajustes(df)
+
     dedup_cols = ["Código","Descrição","Família","Proporção","Qtd/Proporção",
                   "hectare_proporcao_efetivo","proporcao_troca_%","custo_unitario"]
     dedup_cols = [c for c in dedup_cols if c in df.columns]
@@ -329,7 +336,6 @@ def agregar_para_exportacao(df_pecas_proc, resumo_maquina_ref, familia_filter="T
     if familia_filter != "Todos":
         df_escalada = df_escalada[df_escalada["Família"] == familia_filter]
 
-    # 🔒 Dedup duro antes de agrupar
     cols_dedup = ["Código","Descrição","Família","Proporção","Qtd/Proporção",
                   "hectare_proporcao_efetivo","proporcao_troca_%","custo_unitario"]
     cols_dedup = [c for c in cols_dedup if c in df_escalada.columns]
@@ -427,6 +433,26 @@ def auditar_item(row_item, resumo_maquina_ref):
         "proporcao_troca_%": prop_troca,
         "qtd_final": qtd_final
     }
+
+
+# ------------------------------------------------------------
+# Assinatura (para evitar reset ao navegar)
+# ------------------------------------------------------------
+
+def _assinatura_atual():
+    """Cria uma tupla hashable com tudo que influencia o processamento."""
+    return (
+        id(st.session_state.get("df_pecas_raw")),
+        id(st.session_state.get("df_custos_raw")),
+        id(st.session_state.get("df_maquinas_raw")),
+        st.session_state.get("modelo_selecionado"),
+        st.session_state.get("chassi_selecionado"),
+        st.session_state.get("hectare_ano_ref"),
+        st.session_state.get("hectare_hora_ref"),
+        st.session_state.get("largura_ref_m"),
+        st.session_state.get("modo_operacao"),
+        st.session_state.get("prod_base"),
+    )
 
 
 # ------------------------------------------------------------
@@ -577,33 +603,43 @@ if pagina == "1. Entrada de Dados":
 
     st.markdown("---")
 
-    if (
-        st.session_state["df_pecas_raw"] is not None and
-        st.session_state["df_custos_raw"] is not None and
-        st.session_state["df_maquinas_raw"] is not None and
-        st.session_state["modelo_selecionado"] is not None and
+    # >>>>> Evitar reconstrução desnecessária (mantém ajustes ao navegar) <<<<<
+    pode_processar = all([
+        st.session_state["df_pecas_raw"] is not None,
+        st.session_state["df_custos_raw"] is not None,
+        st.session_state["df_maquinas_raw"] is not None,
+        st.session_state["modelo_selecionado"] is not None,
         st.session_state["chassi_selecionado"] is not None
-    ):
-        df_maquinas_proc, resumo_ref = processar_maquinas(
-            st.session_state["df_maquinas_raw"],
-            st.session_state["hectare_ano_ref"],
-            st.session_state["hectare_hora_ref"],
-            st.session_state["largura_ref_m"],
-            st.session_state["modelo_selecionado"],
-            st.session_state["chassi_selecionado"],
-            st.session_state["prod_base"]
-        )
-        st.session_state["df_maquinas_proc"] = df_maquinas_proc
-        st.session_state["resumo_maquina_ref"] = resumo_ref
+    ])
+    if pode_processar:
+        nova_assinatura = _assinatura_atual()
+        assinatura_antiga = st.session_state.get("assinatura_processamento")
 
-        st.session_state["df_pecas_proc"] = construir_df_pecas(
-            st.session_state["df_pecas_raw"],
-            st.session_state["df_custos_raw"],
-            resumo_ref,
-            st.session_state["modo_operacao"]
-        )
+        # Só processa se algo mudou
+        if (st.session_state["df_pecas_proc"] is None) or (nova_assinatura != assinatura_antiga):
+            df_maquinas_proc, resumo_ref = processar_maquinas(
+                st.session_state["df_maquinas_raw"],
+                st.session_state["hectare_ano_ref"],
+                st.session_state["hectare_hora_ref"],
+                st.session_state["largura_ref_m"],
+                st.session_state["modelo_selecionado"],
+                st.session_state["chassi_selecionado"],
+                st.session_state["prod_base"]
+            )
+            st.session_state["df_maquinas_proc"] = df_maquinas_proc
+            st.session_state["resumo_maquina_ref"] = resumo_ref
 
-        st.success("Dados processados e carregados na sessão. Vá para '2. Ajustes de Peças'.")
+            st.session_state["df_pecas_proc"] = construir_df_pecas(
+                st.session_state["df_pecas_raw"],
+                st.session_state["df_custos_raw"],
+                resumo_ref,
+                st.session_state["modo_operacao"]
+            )
+
+            st.session_state["assinatura_processamento"] = nova_assinatura
+            st.success("Dados processados e carregados na sessão. Vá para '2. Ajustes de Peças'.")
+        else:
+            st.info("Parâmetros não mudaram. Mantendo cálculos e ajustes atuais.")
 
 
 # ------------------------------------------------------------
@@ -621,7 +657,7 @@ elif pagina == "2. Ajustes de Peças":
         st.warning("Primeiro importe os dados e processe na página '1. Entrada de Dados'.")
     else:
         st.write("Edite os parâmetros peça a peça. Esses ajustes alimentam os cálculos finais.")
-        st.write("Os valores permanecem salvos enquanto você não recarregar os dados na página 1.")
+        st.write("Os valores **permanecem salvos** ao alternar páginas; só se perdem ao recarregar o app ou importar novas tabelas.")
 
         df_full = st.session_state["df_pecas_proc"].copy()
 
@@ -682,8 +718,7 @@ elif pagina == "2. Ajustes de Peças":
         updated_rows = []
 
         for _, row in df_unique.iterrows():
-            codigo_item = row["Código"]
-
+            codigo_item = format_codigo(row["Código"])  # normaliza chave
             st.markdown("---")
             st.subheader(f"{codigo_item} - {row['Descrição']}")
 
@@ -698,7 +733,11 @@ elif pagina == "2. Ajustes de Peças":
                     "Hectare/Proporção",
                     min_value=0.0,
                     step=1.0,
-                    value=float(row["hectare_proporcao_efetivo"]),
+                    value=float(
+                        st.session_state["ajustes_pecas"].get(codigo_item, {}).get("hect",
+                            row["hectare_proporcao_efetivo"]
+                        )
+                    ),
                     key=f"hectare_prop_{codigo_item}"
                 )
 
@@ -706,7 +745,11 @@ elif pagina == "2. Ajustes de Peças":
                     "Proporção de troca (%)",
                     min_value=0,
                     max_value=100,
-                    value=int(row["proporcao_troca_%"]),
+                    value=int(
+                        st.session_state["ajustes_pecas"].get(codigo_item, {}).get("prop",
+                            row["proporcao_troca_%"]
+                        )
+                    ),
                     key=f"prop_troca_{codigo_item}"
                 )
 
@@ -715,12 +758,20 @@ elif pagina == "2. Ajustes de Peças":
                 st.write(f"Qtd/Proporção: {row['Qtd/Proporção']}")
                 st.write(f"Hectare/Proporção (original): {format_hectare_original(row['Hectare/Proporção'])}")
 
+            # Salva/atualiza persistência por código (normalizado)
+            st.session_state["ajustes_pecas"][codigo_item] = {
+                "hect": float(new_hectare_prop),
+                "prop": int(new_prop_troca),
+            }
+
             updated_rows.append({
                 "Código": codigo_item,
-                "hectare_proporcao_efetivo": new_hectare_prop,
-                "proporcao_troca_%": new_prop_troca
+                "hectare_proporcao_efetivo": float(new_hectare_prop),
+                "proporcao_troca_%": int(new_prop_troca)
             })
 
+        # Aplica na base atual (normalizando a coluna Código para casar com a chave)
+        st.session_state["df_pecas_proc"]["Código"] = st.session_state["df_pecas_proc"]["Código"].apply(format_codigo)
         for u in updated_rows:
             mask_codigo = st.session_state["df_pecas_proc"]["Código"] == u["Código"]
             st.session_state["df_pecas_proc"].loc[mask_codigo, "hectare_proporcao_efetivo"] = u["hectare_proporcao_efetivo"]
@@ -837,10 +888,12 @@ elif pagina == "3. Resumo / Resultados":
         )
 
         with st.expander("Auditoria dos cálculos por item (debug)"):
-            cods = st.session_state["df_pecas_proc"]["Código"].tolist()
+            cods = st.session_state["df_pecas_proc"]["Código"].apply(format_codigo).tolist()
             if cods:
                 cod_sel = st.selectbox("Selecione um Código para auditar", cods, index=0)
-                row_item = st.session_state["df_pecas_proc"][st.session_state["df_pecas_proc"]["Código"] == cod_sel].iloc[0]
+                row_item = st.session_state["df_pecas_proc"][
+                    st.session_state["df_pecas_proc"]["Código"].apply(format_codigo) == cod_sel
+                ].iloc[0]
                 audit = auditar_item(row_item, resumo_ref)
                 if audit:
                     c1, c2, c3 = st.columns(3)
