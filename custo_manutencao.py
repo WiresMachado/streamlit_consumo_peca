@@ -40,10 +40,21 @@ def init_session_state():
         "escopo_resumo": "Apenas chassi selecionado",
 
         # Persistência dos ajustes por Código
-        "ajustes_pecas": {},   # { "00001234": {"hect": float, "prop": int}, ... }
+        # {"00001234": {"hect": float|None, "prop": int|None,
+        #               "manual_hect": bool, "manual_prop": bool}}
+        "ajustes_pecas": {},
 
         # Assinatura do processamento para evitar reconstrução desnecessária
         "assinatura_processamento": None,
+
+        # Parâmetros globais ajustáveis
+        "default_proporcao_troca": 50,
+        "multiplicadores_operacao": {"Leve": 1.5, "Moderado": 1.0, "Extremo": 0.6},
+
+        # Estado para importação de ajustes
+        "ajustes_import_df": None,
+        "ajustes_import_filename": None,
+        "ajustes_import_applied": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -51,8 +62,13 @@ def init_session_state():
 
 
 def aplicar_modo_operacao(valor_hectare_prop, modo):
-    mult = {"Leve": 1.5, "Moderado": 1.0, "Extremo": 0.6}[modo]
-    return float(valor_hectare_prop) * mult
+    mults = st.session_state.get("multiplicadores_operacao",
+                                 {"Leve":1.5,"Moderado":1.0,"Extremo":0.6})
+    mult = float(mults.get(modo, 1.0))
+    try:
+        return float(valor_hectare_prop) * mult
+    except:
+        return 0.0
 
 
 def format_currency(v):
@@ -236,28 +252,31 @@ def _quantidade_recomendada_uma_maquina(row, resumo_maquina_ref):
     return qtd_rec
 
 
+# ---------------- REAPLICAÇÃO DE AJUSTES (respeita apenas o que foi MANUAL) ----------------
+
 def _reaplicar_ajustes(df):
     """
-    Reaplica ajustes persistidos em st.session_state['ajustes_pecas'] por Código.
-    Usa sempre o Código normalizado (format_codigo) como chave.
+    Reaplica somente os campos ajustados MANUALMENTE em st.session_state['ajustes_pecas'].
+    Se não for manual, mantém o valor recalculado (permitindo que o modo/multiplicador atualizem a base).
     """
     ajustes = st.session_state.get("ajustes_pecas", {})
     if not isinstance(ajustes, dict) or df.empty:
         return df
 
-    # Garante Código como string normalizada
     df["Código"] = df["Código"].apply(format_codigo)
 
     for cod, vals in ajustes.items():
         cod_norm = format_codigo(cod)
         m = df["Código"] == cod_norm
-        if not m.any():
+        if not m.any() or not isinstance(vals, dict):
             continue
-        if isinstance(vals, dict):
-            if "hect" in vals and vals["hect"] is not None:
-                df.loc[m, "hectare_proporcao_efetivo"] = float(vals["hect"])
-            if "prop" in vals and vals["prop"] is not None:
-                df.loc[m, "proporcao_troca_%"] = int(vals["prop"])
+
+        if vals.get("manual_hect", False) and ("hect" in vals) and (vals["hect"] is not None):
+            df.loc[m, "hectare_proporcao_efetivo"] = float(vals["hect"])
+
+        if vals.get("manual_prop", False) and ("prop" in vals) and (vals["prop"] is not None):
+            df.loc[m, "proporcao_troca_%"] = int(vals["prop"])
+
     return df
 
 
@@ -277,16 +296,18 @@ def construir_df_pecas(df_pecas, df_custos, resumo_maquina_ref, modo_operacao):
 
     df = dfp.merge(dfc[["Código", "Custo"]], on="Código", how="left")
 
-    # Inicial
+    # Base inicial (afetada por modo e multiplicadores)
     df["hectare_proporcao_efetivo"] = df["Hectare/Proporção"].apply(
         lambda x: aplicar_modo_operacao(x, st.session_state["modo_operacao"])
     )
-    df["proporcao_troca_%"] = 100.0
+
+    # Proporção padrão global (pode ser mudada manualmente por item na página 2)
+    df["proporcao_troca_%"] = float(st.session_state.get("default_proporcao_troca", 50))
 
     df["custo_unitario"] = df["Custo"]
     df["custo_total_base"] = df["Qtd/Proporção"] * df["custo_unitario"]
 
-    # Reaplica os ajustes persistidos (CHAVE!)
+    # Reaplica somente os ajustes manuais
     df = _reaplicar_ajustes(df)
 
     # Recalcula quantidade e custo planejado (por máquina ref)
@@ -309,7 +330,7 @@ def recalcular_pecas_pos_ajuste(df_pecas_proc, resumo_maquina_ref):
         return df_pecas_proc
     df = df_pecas_proc.copy()
 
-    # Reaplica ajustes no recálculo (garantia extra)
+    # Reaplica somente os ajustes manuais (garantia extra)
     df = _reaplicar_ajustes(df)
 
     dedup_cols = ["Código","Descrição","Família","Proporção","Qtd/Proporção",
@@ -435,12 +456,152 @@ def auditar_item(row_item, resumo_maquina_ref):
     }
 
 
+# =================== Cálculo auxiliar p/ Página 2 ===================
+
+def calcular_hect_ref_e_qtd_prevista(row, resumo_maquina_ref, hectare_efetivo_atual, proporcao_troca_atual):
+    """
+    Calcula:
+      - Hectare referência (vida_total): se Proporção='Linha' => hectare_efetivo * n_linhas; senão, por máquina.
+      - Quantidade prevista: usa ha_ano do chassi selecionado, vida_total e Qtd/Proporção,
+        aplicando a proporção de troca informada no input atual.
+    """
+    try:
+        tipo_prop = str(row["Proporção"]).strip().lower()
+        n_linhas = int(resumo_maquina_ref.get("linhas_maquina", 1) or 1)
+        qtd_por_prop = float(row["Qtd/Proporção"])
+        ha_ano = float(resumo_maquina_ref.get("ha_ano_maquina", 0.0) or 0.0)
+        vida_base = float(hectare_efetivo_atual)
+        prop_troca = float(proporcao_troca_atual)
+    except Exception:
+        return 0.0, 0.0
+
+    if tipo_prop == "linha":
+        vida_total = vida_base * n_linhas
+        qtd_total_por_ciclo = qtd_por_prop * n_linhas
+    else:
+        vida_total = vida_base
+        qtd_total_por_ciclo = qtd_por_prop
+
+    if vida_total > 0:
+        ciclos = ha_ano / vida_total
+        consumo_teorico = ciclos * qtd_total_por_ciclo
+        qtd_prevista = consumo_teorico * (prop_troca / 100.0)
+    else:
+        qtd_prevista = 0.0
+
+    return float(vida_total), float(qtd_prevista)
+
+
 # ------------------------------------------------------------
-# Assinatura (para evitar reset ao navegar)
+# === AJUSTES: EXPORT/IMPORT ===
+# ------------------------------------------------------------
+
+def montar_df_ajustes_atual():
+    """
+    Retorna DataFrame com:
+      Código, Hectare/Proporção, Proporção de troca (%)
+    usando os valores ATUAIS da página 2 (já com ajustes/modo).
+    """
+    df = st.session_state.get("df_pecas_proc")
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Código", "Hectare/Proporção", "Proporção de troca (%)"])
+    tmp = df.copy()
+    tmp["Código"] = tmp["Código"].apply(format_codigo)
+    base = (
+        tmp.groupby("Código", as_index=False)
+        .agg({
+            "hectare_proporcao_efetivo": "first",
+            "proporcao_troca_%": "first"
+        })
+        .rename(columns={
+            "hectare_proporcao_efetivo": "Hectare/Proporção",
+            "proporcao_troca_%": "Proporção de troca (%)"
+        })
+        .sort_values("Código")
+        .reset_index(drop=True)
+    )
+    return base
+
+
+def gerar_planilha_ajustes():
+    """
+    Gera buffer Excel com os ajustes atuais (todos os códigos, inclusive sem ajustes manuais).
+    """
+    df_exp = montar_df_ajustes_atual()
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+        df_exp.to_excel(writer, index=False, sheet_name="Ajustes")
+    buffer.seek(0)
+    return buffer
+
+
+def aplicar_importacao_ajustes(df_import):
+    """
+    Aplica em massa os ajustes vindos do Excel (Código, Hectare/Proporção, Proporção de troca (%)).
+    Marca como MANUAL e recalcula base da página 2.
+    """
+    if df_import is None or df_import.empty:
+        return False, "Arquivo vazio ou inválido."
+
+    # Mapeia colunas por case-insensitive
+    cols = {c.strip().lower(): c for c in df_import.columns}
+    req = {
+        "código": None,
+        "hectare/proporção": None,
+        "proporção de troca (%)": None
+    }
+    for k in list(req.keys()):
+        if k in cols:
+            req[k] = cols[k]
+    if None in req.values():
+        return False, "As colunas obrigatórias são: Código, Hectare/Proporção, Proporção de troca (%)."
+
+    df = df_import[[req["código"], req["hectare/proporção"], req["proporção de troca (%)"]]].copy()
+    df.columns = ["Código", "Hectare/Proporção", "Proporção de troca (%)"]
+
+    # Normaliza e coerce
+    df["Código"] = df["Código"].apply(format_codigo)
+    df["Hectare/Proporção"] = pd.to_numeric(df["Hectare/Proporção"], errors="coerce").fillna(0.0)
+    df["Proporção de troca (%)"] = pd.to_numeric(df["Proporção de troca (%)"], errors="coerce").fillna(0.0).astype(int)
+
+    ajustes = st.session_state.get("ajustes_pecas", {}).copy()
+
+    # Aplica como manual
+    for _, r in df.iterrows():
+        cod = r["Código"]
+        ajustes[cod] = {
+            "hect": float(r["Hectare/Proporção"]),
+            "prop": int(r["Proporção de troca (%)"]),
+            "manual_hect": True,
+            "manual_prop": True,
+        }
+
+    st.session_state["ajustes_pecas"] = ajustes
+
+    # Reflete na df_pecas_proc atual e recalcula
+    if st.session_state.get("df_pecas_proc") is not None and not st.session_state["df_pecas_proc"].empty:
+        st.session_state["df_pecas_proc"]["Código"] = st.session_state["df_pecas_proc"]["Código"].apply(format_codigo)
+        for _, r in df.iterrows():
+            m = st.session_state["df_pecas_proc"]["Código"] == r["Código"]
+            st.session_state["df_pecas_proc"].loc[m, "hectare_proporcao_efetivo"] = float(r["Hectare/Proporção"])
+            st.session_state["df_pecas_proc"].loc[m, "proporcao_troca_%"] = int(r["Proporção de troca (%)"])
+
+        st.session_state["df_pecas_proc"] = recalcular_pecas_pos_ajuste(
+            st.session_state["df_pecas_proc"],
+            st.session_state["resumo_maquina_ref"]
+        )
+
+    return True, "Importação aplicada com sucesso."
+
+
+# ------------------------------------------------------------
+# Assinatura (para evitar reset ao navegar) + Reprocessamento central
 # ------------------------------------------------------------
 
 def _assinatura_atual():
     """Cria uma tupla hashable com tudo que influencia o processamento."""
+    mults = st.session_state.get("multiplicadores_operacao",
+                                 {"Leve":1.5,"Moderado":1.0,"Extremo":0.6})
     return (
         id(st.session_state.get("df_pecas_raw")),
         id(st.session_state.get("df_custos_raw")),
@@ -452,7 +613,59 @@ def _assinatura_atual():
         st.session_state.get("largura_ref_m"),
         st.session_state.get("modo_operacao"),
         st.session_state.get("prod_base"),
+        float(mults.get("Leve",1.5)),
+        float(mults.get("Moderado",1.0)),
+        float(mults.get("Extremo",0.6)),
+        int(st.session_state.get("default_proporcao_troca",50)),
     )
+
+def _pode_processar():
+    return all([
+        st.session_state["df_pecas_raw"] is not None,
+        st.session_state["df_custos_raw"] is not None,
+        st.session_state["df_maquinas_raw"] is not None,
+        st.session_state["modelo_selecionado"] is not None,
+        st.session_state["chassi_selecionado"] is not None
+    ])
+
+def run_processamento_if_needed(show_msg=False):
+    """
+    Reprocessa máquinas e peças quando a assinatura mudar.
+    É chamada em TODAS as páginas, garantindo que alterações no modo/multiplicadores
+    reflitam imediatamente na página 2/3.
+    """
+    if not _pode_processar():
+        return
+
+    nova_assinatura = _assinatura_atual()
+    assinatura_antiga = st.session_state.get("assinatura_processamento")
+
+    if (st.session_state["df_pecas_proc"] is None) or (nova_assinatura != assinatura_antiga):
+        df_maquinas_proc, resumo_ref = processar_maquinas(
+            st.session_state["df_maquinas_raw"],
+            st.session_state["hectare_ano_ref"],
+            st.session_state["hectare_hora_ref"],
+            st.session_state["largura_ref_m"],
+            st.session_state["modelo_selecionado"],
+            st.session_state["chassi_selecionado"],
+            st.session_state["prod_base"]
+        )
+        st.session_state["df_maquinas_proc"] = df_maquinas_proc
+        st.session_state["resumo_maquina_ref"] = resumo_ref
+
+        st.session_state["df_pecas_proc"] = construir_df_pecas(
+            st.session_state["df_pecas_raw"],
+            st.session_state["df_custos_raw"],
+            resumo_ref,
+            st.session_state["modo_operacao"]
+        )
+
+        st.session_state["assinatura_processamento"] = nova_assinatura
+        if show_msg:
+            st.success("Dados reprocessados com base nos parâmetros atuais.")
+    else:
+        if show_msg:
+            st.info("Parâmetros não mudaram. Mantendo cálculos e ajustes atuais.")
 
 
 # ------------------------------------------------------------
@@ -575,6 +788,39 @@ if pagina == "1. Entrada de Dados":
                 st.session_state["modo_operacao"] = "Extremo"
         st.info(f"Modo atual: {st.session_state['modo_operacao']}")
 
+    # Expander: parâmetros avançados (multiplicadores + proporção padrão)
+    with st.expander("Parâmetros avançados (opcional)"):
+        st.session_state["modo_operacao"] = st.selectbox(
+            "Modo de operação",
+            ["Leve", "Moderado", "Extremo"],
+            index=["Leve", "Moderado", "Extremo"].index(st.session_state["modo_operacao"])
+        )
+
+        mults = st.session_state["multiplicadores_operacao"]
+        cA, cB, cC = st.columns(3)
+        with cA:
+            mults["Leve"] = st.number_input("Multiplicador - Leve",
+                                            min_value=0.1, max_value=5.0, step=0.1,
+                                            value=float(mults.get("Leve",1.5)))
+        with cB:
+            mults["Moderado"] = st.number_input("Multiplicador - Moderado",
+                                                min_value=0.1, max_value=5.0, step=0.1,
+                                                value=float(mults.get("Moderado",1.0)))
+        with cC:
+            mults["Extremo"] = st.number_input("Multiplicador - Extremo",
+                                               min_value=0.1, max_value=5.0, step=0.1,
+                                               value=float(mults.get("Extremo",0.6)))
+        st.session_state["multiplicadores_operacao"] = mults
+        st.caption("Os multiplicadores acima são aplicados sobre o Hectare/Proporção de cada peça.")
+
+        st.session_state["default_proporcao_troca"] = st.slider(
+            "Proporção de troca padrão (%)",
+            min_value=0, max_value=100, step=1,
+            value=int(st.session_state["default_proporcao_troca"])
+        )
+        st.caption("Esse valor inicial pode ser alterado peça a peça na página 2.")
+
+    # Chassi
     chassi_opcoes = []
     if (
         st.session_state["df_maquinas_raw"] is not None and
@@ -603,50 +849,18 @@ if pagina == "1. Entrada de Dados":
 
     st.markdown("---")
 
-    # >>>>> Evitar reconstrução desnecessária (mantém ajustes ao navegar) <<<<<
-    pode_processar = all([
-        st.session_state["df_pecas_raw"] is not None,
-        st.session_state["df_custos_raw"] is not None,
-        st.session_state["df_maquinas_raw"] is not None,
-        st.session_state["modelo_selecionado"] is not None,
-        st.session_state["chassi_selecionado"] is not None
-    ])
-    if pode_processar:
-        nova_assinatura = _assinatura_atual()
-        assinatura_antiga = st.session_state.get("assinatura_processamento")
-
-        # Só processa se algo mudou
-        if (st.session_state["df_pecas_proc"] is None) or (nova_assinatura != assinatura_antiga):
-            df_maquinas_proc, resumo_ref = processar_maquinas(
-                st.session_state["df_maquinas_raw"],
-                st.session_state["hectare_ano_ref"],
-                st.session_state["hectare_hora_ref"],
-                st.session_state["largura_ref_m"],
-                st.session_state["modelo_selecionado"],
-                st.session_state["chassi_selecionado"],
-                st.session_state["prod_base"]
-            )
-            st.session_state["df_maquinas_proc"] = df_maquinas_proc
-            st.session_state["resumo_maquina_ref"] = resumo_ref
-
-            st.session_state["df_pecas_proc"] = construir_df_pecas(
-                st.session_state["df_pecas_raw"],
-                st.session_state["df_custos_raw"],
-                resumo_ref,
-                st.session_state["modo_operacao"]
-            )
-
-            st.session_state["assinatura_processamento"] = nova_assinatura
-            st.success("Dados processados e carregados na sessão. Vá para '2. Ajustes de Peças'.")
-        else:
-            st.info("Parâmetros não mudaram. Mantendo cálculos e ajustes atuais.")
+    # Reprocessamento central também na página 1
+    run_processamento_if_needed(show_msg=True)
 
 
 # ------------------------------------------------------------
-# PÁGINA 2 - Ajustes de Peças
+# PÁGINA 2 - Ajustes de Peças (com callbacks para sincronização + export/import)
 # ------------------------------------------------------------
 elif pagina == "2. Ajustes de Peças":
     st.title("2. Ajustes de Peças")
+
+    # Reprocessa aqui também
+    run_processamento_if_needed(show_msg=False)
 
     if (
         st.session_state["df_pecas_proc"] is None
@@ -658,6 +872,55 @@ elif pagina == "2. Ajustes de Peças":
     else:
         st.write("Edite os parâmetros peça a peça. Esses ajustes alimentam os cálculos finais.")
         st.write("Os valores **permanecem salvos** ao alternar páginas; só se perdem ao recarregar o app ou importar novas tabelas.")
+
+        # ====== EXPORTAR/IMPORTAR AJUSTES ======
+        with st.expander("Exportar / Importar ajustes (backup)"):
+            c1, c2 = st.columns([1, 2])
+            with c1:
+                buffer_aj = gerar_planilha_ajustes()
+                st.download_button(
+                    label="Exportar ajustes (Excel)",
+                    data=buffer_aj,
+                    file_name="ajustes_pecas.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
+                )
+            with c2:
+                up_file = st.file_uploader(
+                    "Importar ajustes (.xlsx) com colunas: Código, Hectare/Proporção, Proporção de troca (%)",
+                    type=["xlsx"],
+                    key="upload_ajustes_xlsx"
+                )
+
+                # Se um arquivo foi enviado, carregamos e guardamos em session_state
+                if up_file is not None:
+                    # Se for um novo arquivo (nome mudou), recarrega para o estado
+                    if st.session_state["ajustes_import_filename"] != up_file.name:
+                        try:
+                            st.session_state["ajustes_import_df"] = pd.read_excel(up_file)
+                            st.session_state["ajustes_import_filename"] = up_file.name
+                            st.session_state["ajustes_import_applied"] = False
+                        except Exception as e:
+                            st.error(f"Falha ao ler o arquivo: {e}")
+                            st.session_state["ajustes_import_df"] = None
+
+                df_imp = st.session_state.get("ajustes_import_df")
+
+                if df_imp is not None:
+                    st.caption("Pré-visualização dos ajustes importados:")
+                    st.dataframe(df_imp.head(), use_container_width=True)
+
+                    if st.button("Aplicar ajustes importados", use_container_width=True):
+                        ok, msg = aplicar_importacao_ajustes(df_imp)
+                        if ok:
+                            st.session_state["ajustes_import_applied"] = True
+                            st.success(msg)
+                            # Força um rerun apenas uma vez para recarregar os widgets com os novos valores
+                            st.rerun()
+                        else:
+                            st.error(msg)
+                else:
+                    st.caption("Nenhum arquivo de ajustes foi carregado ainda.")
 
         df_full = st.session_state["df_pecas_proc"].copy()
 
@@ -716,68 +979,156 @@ elif pagina == "2. Ajustes de Peças":
         df_unique = df_unique.sort_values(by="Código").reset_index(drop=True)
 
         updated_rows = []
+        ajustes = st.session_state["ajustes_pecas"]
+        resumo_ref = st.session_state["resumo_maquina_ref"]
+        n_linhas_ref = int(resumo_ref.get("linhas_maquina", 1) or 1)
+
+        # ---- Callbacks para sincronização bidirecional ----
+        def cb_from_hect(kh, kr, tipo_lower, nlin):
+            try:
+                v = float(st.session_state[kh])
+            except Exception:
+                v = 0.0
+            st.session_state[kr] = (v * nlin) if (tipo_lower == "linha") else v
+
+        def cb_from_ref(kh, kr, tipo_lower, nlin):
+            try:
+                v = float(st.session_state[kr])
+            except Exception:
+                v = 0.0
+            st.session_state[kh] = (v / nlin) if (tipo_lower == "linha" and nlin > 0) else v
 
         for _, row in df_unique.iterrows():
-            codigo_item = format_codigo(row["Código"])  # normaliza chave
+            codigo_item = format_codigo(row["Código"])
             st.markdown("---")
             st.subheader(f"{codigo_item} - {row['Descrição']}")
 
-            cA, cB, cC = st.columns([2,1,1])
+            # Valores atuais da base recalculada
+            base_hect = float(row["hectare_proporcao_efetivo"])
+            base_prop = int(row["proporcao_troca_%"])
+
+            # Ajuste manual salvo (se houver)
+            aj = ajustes.get(codigo_item, {})
+            default_hect = float(aj["hect"]) if aj.get("manual_hect", False) and ("hect" in aj) else base_hect
+            default_prop = int(aj["prop"]) if aj.get("manual_prop", False) and ("prop" in aj) else base_prop
+
+            # Colunas e imagem
+            has_img = "Imagem/url" in st.session_state["df_pecas_raw"].columns if st.session_state["df_pecas_raw"] is not None else False
+            img_url = None
+            if has_img:
+                try:
+                    raw = st.session_state["df_pecas_raw"]
+                    img_match = raw[raw["Código"].apply(format_codigo) == codigo_item]
+                    if not img_match.empty and isinstance(img_match.iloc[0].get("Imagem/url", None), str):
+                        val = img_match.iloc[0]["Imagem/url"].strip()
+                        if val and (val.startswith("http://") or val.startswith("https://")):
+                            img_url = val
+                except Exception:
+                    img_url = None
+
+            if img_url:
+                cA, cB, cC, cD = st.columns([1.6, 1.2, 1.2, 1.2])
+            else:
+                cA, cB, cC = st.columns([2, 1, 1])
+                cD = None
+
             with cA:
                 st.write(f"Família: {row['Família']}")
                 st.write(f"Custo unitário: {format_currency(row['custo_unitario'])}")
                 st.write(f"Custo total: {format_currency(row['custo_total_base'])}")
 
             with cB:
+                key_hect = f"hectare_prop_{codigo_item}"
+                key_ref  = f"hect_ref_{codigo_item}"
+                key_prop = f"prop_troca_{codigo_item}"
+
+                # Inicializa estados (somente primeira vez)
+                if key_hect not in st.session_state:
+                    st.session_state[key_hect] = float(default_hect)
+
+                tipo_prop_lower = str(row["Proporção"]).strip().lower()
+                default_ref_calc = (float(st.session_state[key_hect]) * n_linhas_ref) if (tipo_prop_lower == "linha") else float(st.session_state[key_hect])
+
+                if key_ref not in st.session_state:
+                    st.session_state[key_ref] = float(default_ref_calc)
+
+                if key_prop not in st.session_state:
+                    st.session_state[key_prop] = int(default_prop)
+
+                # Widgets com callbacks (Enter e +/- sincronizam)
                 new_hectare_prop = st.number_input(
                     "Hectare/Proporção",
                     min_value=0.0,
                     step=1.0,
-                    value=float(
-                        st.session_state["ajustes_pecas"].get(codigo_item, {}).get("hect",
-                            row["hectare_proporcao_efetivo"]
-                        )
-                    ),
-                    key=f"hectare_prop_{codigo_item}"
+                    value=float(st.session_state[key_hect]),
+                    key=key_hect,
+                    on_change=lambda kh=key_hect, kr=key_ref, t=tipo_prop_lower, nl=n_linhas_ref: cb_from_hect(kh, kr, t, nl)
+                )
+
+                new_ref_input = st.number_input(
+                    "Hectare referência",
+                    min_value=0.0,
+                    step=1.0,
+                    value=float(st.session_state[key_ref]),
+                    key=key_ref,
+                    on_change=lambda kh=key_hect, kr=key_ref, t=tipo_prop_lower, nl=n_linhas_ref: cb_from_ref(kh, kr, t, nl)
                 )
 
                 new_prop_troca = st.slider(
                     "Proporção de troca (%)",
-                    min_value=0,
-                    max_value=100,
-                    value=int(
-                        st.session_state["ajustes_pecas"].get(codigo_item, {}).get("prop",
-                            row["proporcao_troca_%"]
-                        )
-                    ),
-                    key=f"prop_troca_{codigo_item}"
+                    min_value=0, max_value=100,
+                    value=int(st.session_state[key_prop]),
+                    key=key_prop
                 )
+
+                # Usa os valores atuais do estado (já sincronizados pelas callbacks)
+                synced_hect = float(st.session_state[key_hect])
+                synced_ref  = float(st.session_state[key_ref])
+
+                # Quantidade prevista
+                vida_total, qtd_prevista = calcular_hect_ref_e_qtd_prevista(
+                    row, resumo_ref, synced_hect, int(st.session_state[key_prop])
+                )
+                st.write(f"**Quantidade prevista**: {int(round(qtd_prevista))}")
 
             with cC:
                 st.write(f"Proporção declarada: {row['Proporção']}")
                 st.write(f"Qtd/Proporção: {row['Qtd/Proporção']}")
                 st.write(f"Hectare/Proporção (original): {format_hectare_original(row['Hectare/Proporção'])}")
+                st.write(f"Linhas do chassi (ref): {n_linhas_ref}")
 
-            # Salva/atualiza persistência por código (normalizado)
-            st.session_state["ajustes_pecas"][codigo_item] = {
-                "hect": float(new_hectare_prop),
-                "prop": int(new_prop_troca),
-            }
+            if cD is not None and img_url:
+                with cD:
+                    st.image(img_url, caption="Imagem da peça", use_container_width=True)
+
+            # Persistência por código (manual flags)
+            tol = 1e-9
+            manual_hect = abs(float(synced_hect) - float(base_hect)) > tol
+            manual_prop = int(st.session_state[key_prop]) != int(base_prop)
+
+            if manual_hect or manual_prop or (codigo_item in ajustes):
+                ajustes[codigo_item] = {
+                    "hect": float(synced_hect) if manual_hect else ajustes.get(codigo_item, {}).get("hect"),
+                    "prop": int(st.session_state[key_prop]) if manual_prop else ajustes.get(codigo_item, {}).get("prop"),
+                    "manual_hect": manual_hect or ajustes.get(codigo_item, {}).get("manual_hect", False),
+                    "manual_prop": manual_prop or ajustes.get(codigo_item, {}).get("manual_prop", False),
+                }
 
             updated_rows.append({
                 "Código": codigo_item,
-                "hectare_proporcao_efetivo": float(new_hectare_prop),
-                "proporcao_troca_%": int(new_prop_troca)
+                "hectare_proporcao_efetivo": float(synced_hect),
+                "proporcao_troca_%": int(st.session_state[key_prop])
             })
 
-        # Aplica na base atual (normalizando a coluna Código para casar com a chave)
+        st.session_state["ajustes_pecas"] = ajustes
+
+        # Aplica visualmente na base atual (reflete imediatamente)
         st.session_state["df_pecas_proc"]["Código"] = st.session_state["df_pecas_proc"]["Código"].apply(format_codigo)
         for u in updated_rows:
-            mask_codigo = st.session_state["df_pecas_proc"]["Código"] == u["Código"]
-            st.session_state["df_pecas_proc"].loc[mask_codigo, "hectare_proporcao_efetivo"] = u["hectare_proporcao_efetivo"]
-            st.session_state["df_pecas_proc"].loc[mask_codigo, "proporcao_troca_%"] = u["proporcao_troca_%"]
+            m = st.session_state["df_pecas_proc"]["Código"] == u["Código"]
+            st.session_state["df_pecas_proc"].loc[m, "hectare_proporcao_efetivo"] = u["hectare_proporcao_efetivo"]
+            st.session_state["df_pecas_proc"].loc[m, "proporcao_troca_%"] = u["proporcao_troca_%"]
 
-        resumo_ref = st.session_state["resumo_maquina_ref"]
         st.session_state["df_pecas_proc"] = recalcular_pecas_pos_ajuste(
             st.session_state["df_pecas_proc"],
             resumo_ref
@@ -791,6 +1142,9 @@ elif pagina == "2. Ajustes de Peças":
 # ------------------------------------------------------------
 elif pagina == "3. Resumo / Resultados":
     st.title("3. Resumo / Resultados")
+
+    # Reprocessa aqui também (garante consistência no resumo)
+    run_processamento_if_needed(show_msg=False)
 
     if (
         st.session_state["df_pecas_proc"] is None
