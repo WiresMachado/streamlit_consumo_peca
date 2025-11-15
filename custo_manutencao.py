@@ -39,6 +39,10 @@ def init_session_state():
         "filtro_familia_resumo": "Todos",
         "escopo_resumo": "Apenas chassi selecionado",
 
+        # >>> novos estados de filtro da página 3 <<<
+        "filtro_campo_resumo": "Todos",
+        "filtro_valor_resumo": "",
+
         # Persistência dos ajustes por Código
         # {"00001234": {"hect": float|None, "prop": int|None,
         #               "manual_hect": bool, "manual_prop": bool}}
@@ -1217,6 +1221,7 @@ elif pagina == "3. Resumo / Resultados":
 
         st.subheader(f"Consumo projetado de peças ({st.session_state['escopo_resumo'].lower()})")
 
+        # Base numérica agregada
         df_export_preview_num = agregar_para_exportacao(
             st.session_state["df_pecas_proc"],
             resumo_ref,
@@ -1224,9 +1229,43 @@ elif pagina == "3. Resumo / Resultados":
             escopo=st.session_state["escopo_resumo"]
         ).copy()
 
-        df_export_preview_num["Qtd recomendada"] = (
-            df_export_preview_num["Qtd recomendada"].apply(lambda x: int(round(x if pd.notna(x) else 0)))
-        )
+        # -------- NOVO FILTRO TEXTO NA PÁGINA 3 --------
+        if not df_export_preview_num.empty:
+            cols_busca = df_export_preview_num.columns.tolist()
+            opcoes_campo = ["Todos"] + cols_busca
+
+            st.session_state["filtro_campo_resumo"] = st.selectbox(
+                "Filtrar por campo",
+                opcoes_campo,
+                index=(
+                    opcoes_campo.index(st.session_state["filtro_campo_resumo"])
+                    if st.session_state["filtro_campo_resumo"] in opcoes_campo
+                    else 0
+                )
+            )
+
+            st.session_state["filtro_valor_resumo"] = st.text_input(
+                "Texto para buscar (contém)",
+                value=st.session_state["filtro_valor_resumo"]
+            )
+
+            filtro_txt_resumo = st.session_state["filtro_valor_resumo"].strip().lower()
+            campo_resumo = st.session_state["filtro_campo_resumo"]
+
+            if filtro_txt_resumo:
+                if campo_resumo == "Todos":
+                    mask = False
+                    for c in cols_busca:
+                        mask = mask | df_export_preview_num[c].astype(str).str.lower().str.contains(filtro_txt_resumo)
+                else:
+                    mask = df_export_preview_num[campo_resumo].astype(str).str.lower().str.contains(filtro_txt_resumo)
+                df_export_preview_num = df_export_preview_num[mask]
+
+        # Depois do filtro, arredonda Qtd recomendada para exibição
+        if not df_export_preview_num.empty:
+            df_export_preview_num["Qtd recomendada"] = (
+                df_export_preview_num["Qtd recomendada"].apply(lambda x: int(round(x if pd.notna(x) else 0)))
+            )
 
         st.dataframe(
             df_export_preview_num,
