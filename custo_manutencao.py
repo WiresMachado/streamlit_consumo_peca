@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from io import BytesIO
+import datetime
+import altair as alt
 
 st.set_page_config(
     page_title="Manutenção / Consumo de Peças",
@@ -45,9 +47,12 @@ def init_session_state():
         "filtro_valor_resumo": "",
 
         # Persistência dos ajustes por Código
-        # {"00001234": {"hect": float|None, "prop": int|None,
-        #               "manual_hect": bool, "manual_prop": bool,
-        #               "modo_qtd": "Proporcional"/"Inteiro", "manual_modo": bool}}
+        # {"00001234": {
+        #    "hect": float|None, "prop": int|None,
+        #    "manual_hect": bool, "manual_prop": bool,
+        #    "modo_qtd": "Proporcional"/"Inteiro" ou None,
+        #    "manual_modo": bool
+        # }}
         "ajustes_pecas": {},
 
         # Assinatura do processamento para evitar reconstrução desnecessária
@@ -167,10 +172,9 @@ def processar_maquinas(
     modelo_escolhido, chassi_ref_escolhido
 ):
     """
-    Agora SEM a opção 'Por máquina'.
-    Sempre considera que o Hectare médio por ano informado na página 1
-    está associado à Largura_ref_m, e escala proporcionalmente pela
-    largura real de cada máquina (Linhas * Espaçamento).
+    Sempre proporcional por largura:
+    - hectare_ano_ref e largura_ref_m são a máquina de referência
+    - para cada chassi: escala por largura_total_m (Linhas * Espaçamento)
     """
     df = df_maquinas.copy()
     df = df[df["Modelo"] == modelo_escolhido].copy()
@@ -187,10 +191,8 @@ def processar_maquinas(
         }
         return pd.DataFrame(), resumo_ref
 
-    # largura real da máquina (m)
     df["largura_total_m"] = (df["Linhas"] * df["Espaçamento"]) / 100.0
 
-    # SEMPRE proporcional por largura
     if largura_ref_m and largura_ref_m != 0:
         ha_hora_por_metro_ref = float(hectare_hora_ref or 0.0) / largura_ref_m
         ha_ano_por_metro_ref = float(hectare_ano_ref or 0.0) / largura_ref_m
@@ -229,12 +231,13 @@ def processar_maquinas(
     return df_sorted, resumo_ref
 
 
-# -------- helper para escolher modo de cálculo por peça ou global --------
+# -------- helper: modo de cálculo por peça ou global --------
 
 def _modo_qtd_para_codigo(row_or_codigo):
     """
-    Retorna o modo de cálculo da quantidade para um código específico,
-    se definido em ajustes_pecas; senão, retorna o modo global.
+    Retorna o modo de cálculo da quantidade:
+      - se existir manual_modo=True e modo_qtd válido no ajustes_pecas => usa esse
+      - senão => usa o modo global da página 1
     """
     ajustes = st.session_state.get("ajustes_pecas", {})
     try:
@@ -245,21 +248,28 @@ def _modo_qtd_para_codigo(row_or_codigo):
     except Exception:
         cod = None
 
-    if cod and cod in ajustes and "modo_qtd" in ajustes[cod] and ajustes[cod]["modo_qtd"] is not None:
-        return ajustes[cod]["modo_qtd"]
-    return st.session_state.get("modo_calculo_qtd", "Proporcional")
+    modo_global = st.session_state.get("modo_calculo_qtd", "Proporcional")
+
+    if not cod or cod not in ajustes:
+        return modo_global
+
+    vals = ajustes[cod]
+    if vals.get("manual_modo", False) and vals.get("modo_qtd") in ["Proporcional", "Inteiro"]:
+        return vals["modo_qtd"]
+
+    return modo_global
 
 
-# -------- helper para calcular quantidade por máquina específica --------
+# -------- helper: cálculo por máquina específica --------
 
 def _quantidade_para_maquina_especifica(row, ha_ano_maquina, n_linhas_maquina):
     """
     Calcula a quantidade recomendada de uma peça para UMA máquina específica,
     usando os parâmetros dessa máquina (hectares/ano e nº de linhas).
-    Respeita o modo_calculo_qtd global e o modo específico da peça (se houver).
+    Respeita modo global e overrides por peça.
     """
     try:
-        vida_base = float(row["hectare_proporcao_efetivo"])  # durabilidade (Hectare/Proporção ajustado)
+        vida_base = float(row["hectare_proporcao_efetivo"])  # durabilidade ajustada
         qtd_por_prop = float(row["Qtd/Proporção"])
         prop_troca = float(row["proporcao_troca_%"])
         tipo_prop = str(row["Proporção"]).strip().lower()
@@ -272,7 +282,6 @@ def _quantidade_para_maquina_especifica(row, ha_ano_maquina, n_linhas_maquina):
     ha_ano = float(ha_ano_maquina or 0.0)
     n_linhas = int(n_linhas_maquina or 1)
 
-    # Se proporção = linha, vida_base é por linha; agregamos para máquina
     if tipo_prop == "linha":
         vida_total = vida_base * n_linhas
         qtd_total_por_ciclo = qtd_por_prop * n_linhas
@@ -288,7 +297,7 @@ def _quantidade_para_maquina_especifica(row, ha_ano_maquina, n_linhas_maquina):
     ciclos_raw = ha_ano / vida_total
     if modo_qtd == "Inteiro":
         ciclos = np.floor(ciclos_raw)
-    else:  # Proporcional
+    else:
         ciclos = ciclos_raw
 
     consumo_teorico = ciclos * qtd_total_por_ciclo
@@ -402,9 +411,7 @@ def recalcular_pecas_pos_ajuste(df_pecas_proc, resumo_maquina_ref):
 
 def agregar_para_exportacao(df_pecas_proc, resumo_maquina_ref, familia_filter="Todos", escopo="Apenas chassi selecionado"):
     """
-    Agora não multiplica mais cegamente por n_chassis.
-    Em vez disso, calcula a quantidade por chassi (usando df_maquinas_proc)
-    e soma, respeitando "Apenas chassi selecionado" x "Frota inteira".
+    Agora calcula quantidade 'somando por chassi' de verdade, respeitando modo de cálculo.
     """
     if df_pecas_proc is None or df_pecas_proc.empty:
         return pd.DataFrame(columns=["Código", "Descrição", "Família", "Qtd recomendada", "Custo total"])
@@ -413,7 +420,6 @@ def agregar_para_exportacao(df_pecas_proc, resumo_maquina_ref, familia_filter="T
     if familia_filter != "Todos":
         df_escalada = df_escalada[df_escalada["Família"] == familia_filter]
 
-    # Dedup por peça (não por máquina)
     cols_dedup = ["Código", "Descrição", "Família", "Proporção", "Qtd/Proporção",
                   "hectare_proporcao_efetivo", "proporcao_troca_%", "custo_unitario"]
     cols_dedup = [c for c in cols_dedup if c in df_escalada.columns]
@@ -437,11 +443,10 @@ def agregar_para_exportacao(df_pecas_proc, resumo_maquina_ref, familia_filter="T
             if chassi_sel and chassi_sel != "Todos":
                 df_maqs_local = df_maqs_local[df_maqs_local["Chassi"] == str(chassi_sel)]
             else:
-                # se 'Todos', usa o primeiro chassi (mesmo critério do processar_maquinas)
                 df_maqs_local = df_maqs_local.sort_values(by="Chassi").head(1)
         else:
             # Frota inteira: usa todos os chassis do modelo
-            pass  # df_maqs_local já contém todos
+            pass
 
         qts = []
         custos = []
@@ -484,10 +489,6 @@ def gerar_planilha_exportacao(df_pecas_proc, resumo_maquina_ref, familia_filter=
 
 
 def calcular_indicadores_resumo(df_pecas_proc, resumo_maquina_ref, escopo="Apenas chassi selecionado"):
-    """
-    Usa a mesma lógica de agregação de peças para calcular o custo total do escopo.
-    Para custo médio por hectare/hora, mantém a referência na máquina de referência.
-    """
     if df_pecas_proc is None or df_pecas_proc.empty:
         return {
             "custo_total_estoque": 0.0,
@@ -503,7 +504,6 @@ def calcular_indicadores_resumo(df_pecas_proc, resumo_maquina_ref, escopo="Apena
     )
     custo_total_escopo = df_agr["Custo total"].sum() if not df_agr.empty else 0.0
 
-    # custos médios continuam baseados apenas na máquina de referência (por máquina)
     ha_ano = resumo_maquina_ref.get("ha_ano_maquina", 0.0)
     horas_ano = resumo_maquina_ref.get("horas_maquina_ano", 0.0)
 
@@ -699,11 +699,9 @@ def aplicar_importacao_ajustes(df_import):
     if "modo de cálculo" in cols:
         opt_modo_col = cols["modo de cálculo"]
 
-    # Seleciona obrigatórias
     df = df_import[[req["código"], req["hectare/proporção"], req["proporção de troca (%)"]]].copy()
     df.columns = ["Código", "Hectare/Proporção", "Proporção de troca (%)"]
 
-    # Se existir coluna opcional, adiciona
     if opt_modo_col is not None:
         df["Modo de cálculo"] = df_import[opt_modo_col]
         df["Modo de cálculo"] = (
@@ -713,12 +711,10 @@ def aplicar_importacao_ajustes(df_import):
             .str.capitalize()
             .replace({"Proporcional": "Proporcional", "Inteiro": "Inteiro"})
         )
-        # qualquer coisa diferente vira NaN para não bagunçar
         df.loc[~df["Modo de cálculo"].isin(["Proporcional", "Inteiro"]), "Modo de cálculo"] = np.nan
     else:
         df["Modo de cálculo"] = np.nan
 
-    # Normaliza e coerce dos outros campos
     df["Código"] = df["Código"].apply(format_codigo)
     df["Hectare/Proporção"] = pd.to_numeric(df["Hectare/Proporção"], errors="coerce").fillna(0.0)
     df["Proporção de troca (%)"] = pd.to_numeric(df["Proporção de troca (%)"], errors="coerce").fillna(0.0).astype(int)
@@ -726,13 +722,11 @@ def aplicar_importacao_ajustes(df_import):
     ajustes = st.session_state.get("ajustes_pecas", {}).copy()
     modo_global = st.session_state.get("modo_calculo_qtd", "Proporcional")
 
-    # Aplica como manual
     for _, r in df.iterrows():
         cod = r["Código"]
         antigo = ajustes.get(cod, {})
         modo_importado = r["Modo de cálculo"] if isinstance(r.get("Modo de cálculo", np.nan), str) and r["Modo de cálculo"] in ["Proporcional", "Inteiro"] else antigo.get("modo_qtd", None)
 
-        # se ainda não existir modo (nem antigo, nem importado válido), usa global
         if modo_importado is None:
             modo_importado = antigo.get("modo_qtd", modo_global)
 
@@ -744,12 +738,11 @@ def aplicar_importacao_ajustes(df_import):
             "manual_hect": True,
             "manual_prop": True,
             "modo_qtd": modo_importado,
-            "manual_modo": manual_modo or antigo.get("manual_modo", False),
+            "manual_modo": manual_modo,
         }
 
     st.session_state["ajustes_pecas"] = ajustes
 
-    # Reflete na df_pecas_proc atual e recalcula
     if st.session_state.get("df_pecas_proc") is not None and not st.session_state["df_pecas_proc"].empty:
         st.session_state["df_pecas_proc"]["Código"] = st.session_state["df_pecas_proc"]["Código"].apply(format_codigo)
         for _, r in df.iterrows():
@@ -804,8 +797,9 @@ def _pode_processar():
 def run_processamento_if_needed(show_msg=False):
     """
     Reprocessa máquinas e peças quando a assinatura mudar.
-    É chamada em TODAS as páginas, garantindo que alterações no modo/multiplicadores
-    e no modo de cálculo de quantidade reflitam imediatamente na página 2/3.
+    Inclui modo_calculo_qtd, então mudar Proporcional/Inteiro na página 1
+    força reprocessamento.
+    Também reseta os rádios de modo das peças que NÃO são manuais.
     """
     if not _pode_processar():
         return
@@ -833,6 +827,15 @@ def run_processamento_if_needed(show_msg=False):
         )
 
         st.session_state["assinatura_processamento"] = nova_assinatura
+
+        # NOVO: sincroniza os rádios de modo com o global para quem NÃO é manual
+        ajustes = st.session_state.get("ajustes_pecas", {})
+        for cod, vals in ajustes.items():
+            if not vals.get("manual_modo", False):
+                key = f"modo_qtd_{format_codigo(cod)}"
+                if key in st.session_state:
+                    del st.session_state[key]
+
         if show_msg:
             st.success("Dados reprocessados com base nos parâmetros atuais.")
     else:
@@ -847,7 +850,7 @@ def run_processamento_if_needed(show_msg=False):
 init_session_state()
 pagina = st.sidebar.radio(
     "Navegação",
-    ["1. Entrada de Dados", "2. Ajustes de Peças", "3. Resumo / Resultados"]
+    ["1. Entrada de Dados", "2. Ajustes de Peças", "3. Resumo / Resultados", "4. Análise operacional"]
 )
 
 # ------------------------------------------------------------
@@ -899,8 +902,6 @@ if pagina == "1. Entrada de Dados":
 
     st.markdown("---")
     st.subheader("Parâmetros operacionais")
-
-    # SEM rádio 'Por máquina' x 'Por metro' – sempre proporcional pela largura
 
     if st.session_state["df_maquinas_raw"] is not None:
         modelos_disponiveis = sorted(st.session_state["df_maquinas_raw"]["Modelo"].dropna().unique())
@@ -955,7 +956,6 @@ if pagina == "1. Entrada de Dados":
                 st.session_state["modo_operacao"] = "Extremo"
         st.info(f"Modo atual: {st.session_state['modo_operacao']}")
 
-    # Expander: parâmetros avançados (multiplicadores + proporção padrão)
     with st.expander("Parâmetros avançados (opcional)"):
         st.session_state["modo_operacao"] = st.selectbox(
             "Modo de operação",
@@ -1032,17 +1032,15 @@ if pagina == "1. Entrada de Dados":
 
     st.markdown("---")
 
-    # Reprocessamento central também na página 1
     run_processamento_if_needed(show_msg=True)
 
 
 # ------------------------------------------------------------
-# PÁGINA 2 - Ajustes de Peças (com callbacks para sincronização + export/import)
+# PÁGINA 2 - Ajustes de Peças
 # ------------------------------------------------------------
 elif pagina == "2. Ajustes de Peças":
     st.title("2. Ajustes de Peças")
 
-    # Reprocessa aqui também
     run_processamento_if_needed(show_msg=False)
 
     if (
@@ -1075,9 +1073,7 @@ elif pagina == "2. Ajustes de Peças":
                     key="upload_ajustes_xlsx"
                 )
 
-                # Se um arquivo foi enviado, carregamos e guardamos em session_state
                 if up_file is not None:
-                    # Se for um novo arquivo (nome mudou), recarrega para o estado
                     if st.session_state["ajustes_import_filename"] != up_file.name:
                         try:
                             st.session_state["ajustes_import_df"] = pd.read_excel(up_file)
@@ -1098,7 +1094,6 @@ elif pagina == "2. Ajustes de Peças":
                         if ok:
                             st.session_state["ajustes_import_applied"] = True
                             st.success(msg)
-                            # Força um rerun apenas uma vez para recarregar os widgets com os novos valores
                             st.rerun()
                         else:
                             st.error(msg)
@@ -1166,7 +1161,6 @@ elif pagina == "2. Ajustes de Peças":
         resumo_ref = st.session_state["resumo_maquina_ref"]
         n_linhas_ref = int(resumo_ref.get("linhas_maquina", 1) or 1)
 
-        # ---- Callbacks para sincronização bidirecional ----
         def cb_from_hect(kh, kr, tipo_lower, nlin):
             try:
                 v = float(st.session_state[kh])
@@ -1181,22 +1175,27 @@ elif pagina == "2. Ajustes de Peças":
                 v = 0.0
             st.session_state[kh] = (v / nlin) if (tipo_lower == "linha" and nlin > 0) else v
 
+        modo_global = st.session_state.get("modo_calculo_qtd", "Proporcional")
+
         for _, row in df_unique.iterrows():
             codigo_item = format_codigo(row["Código"])
             st.markdown("---")
             st.subheader(f"{codigo_item} - {row['Descrição']}")
 
-            # Valores atuais da base recalculada
             base_hect = float(row["hectare_proporcao_efetivo"])
             base_prop = int(row["proporcao_troca_%"])
 
-            # Ajuste manual salvo (se houver)
             aj = ajustes.get(codigo_item, {})
+            manual_modo_flag = aj.get("manual_modo", False)
+
+            if manual_modo_flag and aj.get("modo_qtd") in ["Proporcional", "Inteiro"]:
+                default_modo = aj["modo_qtd"]
+            else:
+                default_modo = modo_global
+
             default_hect = float(aj["hect"]) if aj.get("manual_hect", False) and ("hect" in aj) else base_hect
             default_prop = int(aj["prop"]) if aj.get("manual_prop", False) and ("prop" in aj) else base_prop
-            default_modo = aj.get("modo_qtd", st.session_state.get("modo_calculo_qtd", "Proporcional"))
 
-            # Colunas e imagem
             has_img = "Imagem/url" in st.session_state["df_pecas_raw"].columns if st.session_state["df_pecas_raw"] is not None else False
             img_url = None
             if has_img:
@@ -1221,8 +1220,8 @@ elif pagina == "2. Ajustes de Peças":
                 st.write(f"Custo unitário: {format_currency(row['custo_unitario'])}")
                 st.write(f"Custo total: {format_currency(row['custo_total_base'])}")
 
-                # seletor de modo de cálculo por peça
                 key_modo = f"modo_qtd_{codigo_item}"
+                # Inicializa só se ainda não existe; assim o usuário pode sobrescrever
                 if key_modo not in st.session_state:
                     st.session_state[key_modo] = default_modo
 
@@ -1238,7 +1237,6 @@ elif pagina == "2. Ajustes de Peças":
                 key_ref = f"hect_ref_{codigo_item}"
                 key_prop = f"prop_troca_{codigo_item}"
 
-                # Inicializa estados (somente primeira vez)
                 if key_hect not in st.session_state:
                     st.session_state[key_hect] = float(default_hect)
 
@@ -1251,7 +1249,6 @@ elif pagina == "2. Ajustes de Peças":
                 if key_prop not in st.session_state:
                     st.session_state[key_prop] = int(default_prop)
 
-                # Widgets com callbacks
                 new_hectare_prop = st.number_input(
                     "Hectare/Proporção",
                     min_value=0.0,
@@ -1277,11 +1274,9 @@ elif pagina == "2. Ajustes de Peças":
                     key=key_prop
                 )
 
-                # Usa os valores atuais do estado (já sincronizados pelas callbacks)
                 synced_hect = float(st.session_state[key_hect])
                 synced_ref = float(st.session_state[key_ref])
 
-                # Quantidade prevista (agora usando explicitamente o modo_escolhido)
                 vida_total, qtd_prevista = calcular_hect_ref_e_qtd_prevista(
                     row,
                     resumo_ref,
@@ -1301,22 +1296,20 @@ elif pagina == "2. Ajustes de Peças":
                 with cD:
                     st.image(img_url, caption="Imagem da peça", use_container_width=True)
 
-            # Persistência por código (manual flags)
             tol = 1e-9
             manual_hect = abs(float(synced_hect) - float(base_hect)) > tol
             manual_prop = int(st.session_state[key_prop]) != int(base_prop)
-            manual_modo = modo_escolhido != st.session_state.get("modo_calculo_qtd", "Proporcional")
+            manual_modo = (modo_escolhido != modo_global)
 
             antigo = ajustes.get(codigo_item, {})
 
-            # sempre salvamos modo_qtd = modo_escolhido, independente de ser igual ou não ao global
             ajustes[codigo_item] = {
                 "hect": float(synced_hect) if manual_hect else antigo.get("hect"),
                 "prop": int(st.session_state[key_prop]) if manual_prop else antigo.get("prop"),
                 "manual_hect": manual_hect or antigo.get("manual_hect", False),
                 "manual_prop": manual_prop or antigo.get("manual_prop", False),
                 "modo_qtd": modo_escolhido,
-                "manual_modo": manual_modo or antigo.get("manual_modo", False),
+                "manual_modo": manual_modo,
             }
 
             updated_rows.append({
@@ -1327,7 +1320,6 @@ elif pagina == "2. Ajustes de Peças":
 
         st.session_state["ajustes_pecas"] = ajustes
 
-        # Aplica visualmente na base atual (reflete imediatamente)
         st.session_state["df_pecas_proc"]["Código"] = st.session_state["df_pecas_proc"]["Código"].apply(format_codigo)
         for u in updated_rows:
             m = st.session_state["df_pecas_proc"]["Código"] == u["Código"]
@@ -1348,7 +1340,6 @@ elif pagina == "2. Ajustes de Peças":
 elif pagina == "3. Resumo / Resultados":
     st.title("3. Resumo / Resultados")
 
-    # Reprocessa aqui também (garante consistência no resumo)
     run_processamento_if_needed(show_msg=False)
 
     if (
@@ -1422,7 +1413,6 @@ elif pagina == "3. Resumo / Resultados":
 
         st.subheader(f"Consumo projetado de peças ({st.session_state['escopo_resumo'].lower()})")
 
-        # Base numérica agregada
         df_export_preview_num = agregar_para_exportacao(
             st.session_state["df_pecas_proc"],
             resumo_ref,
@@ -1430,7 +1420,6 @@ elif pagina == "3. Resumo / Resultados":
             escopo=st.session_state["escopo_resumo"]
         ).copy()
 
-        # FILTRO TEXTO NA PÁGINA 3
         if not df_export_preview_num.empty:
             cols_busca = df_export_preview_num.columns.tolist()
             opcoes_campo = ["Todos"] + cols_busca
@@ -1462,7 +1451,6 @@ elif pagina == "3. Resumo / Resultados":
                     mask = df_export_preview_num[campo_resumo].astype(str).str.lower().str.contains(filtro_txt_resumo)
                 df_export_preview_num = df_export_preview_num[mask]
 
-        # Depois do filtro, arredonda Qtd recomendada para exibição
         if not df_export_preview_num.empty:
             df_export_preview_num["Qtd recomendada"] = (
                 df_export_preview_num["Qtd recomendada"].apply(lambda x: int(round(x if pd.notna(x) else 0)))
@@ -1517,3 +1505,430 @@ elif pagina == "3. Resumo / Resultados":
             file_name="planejamento_manutencao.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+
+
+# ------------------------------------------------------------
+# PÁGINA 4 - Análise operacional
+# ------------------------------------------------------------
+elif pagina == "4. Análise operacional":
+    st.title("4. Análise operacional")
+
+    run_processamento_if_needed(show_msg=False)
+
+    if (
+        st.session_state["df_pecas_proc"] is None
+        or st.session_state["df_maquinas_proc"] is None
+        or st.session_state["df_pecas_proc"].empty
+        or st.session_state["resumo_maquina_ref"] is None
+    ):
+        st.warning("Você ainda não carregou dados ou não fez os ajustes. Volte para as etapas anteriores.")
+    else:
+        resumo_ref = st.session_state["resumo_maquina_ref"]
+
+        st.write(
+            f"Modelo: {resumo_ref.get('modelo','-')} • Chassi ref: {resumo_ref.get('chassi_ref','-')} "
+            f"• Linhas: {resumo_ref.get('linhas_maquina','?')} • Frota (modelo): {resumo_ref.get('n_chassis_frota', 1)}"
+        )
+
+        st.markdown("---")
+
+        # ---------------- Parâmetros operacionais da página 4 ----------------
+        col_p1, col_p2 = st.columns(2)
+
+        with col_p1:
+            # Horas de trabalho por dia – número com 2 casas decimais
+            if "horas_trabalho_dia" not in st.session_state:
+                st.session_state["horas_trabalho_dia"] = 0.0
+
+            horas_trabalho_dia = st.number_input(
+                "Horas de trabalho por dia",
+                min_value=0.0,
+                step=0.25,
+                format="%.2f",
+                value=float(st.session_state["horas_trabalho_dia"])
+            )
+            st.session_state["horas_trabalho_dia"] = float(horas_trabalho_dia)
+
+        with col_p2:
+            # Início da operação – date_input com calendário
+            if "inicio_operacao" not in st.session_state:
+                st.session_state["inicio_operacao"] = datetime.date.today()
+            inicio_operacao = st.date_input(
+                "Início da operação",
+                value=st.session_state["inicio_operacao"],
+                key="inicio_operacao_date"
+            )
+            st.session_state["inicio_operacao"] = inicio_operacao
+
+        # ---------------- Cálculos derivados (referência) ----------------
+        hectare_ano_ref = float(resumo_ref.get("ha_ano_maquina", 0.0) or 0.0)
+        hectare_hora_ref = float(resumo_ref.get("ha_hora_maquina", 0.0) or 0.0)
+
+        if hectare_ano_ref > 0 and hectare_hora_ref > 0:
+            horas_total_operacao = hectare_ano_ref / hectare_hora_ref
+        else:
+            horas_total_operacao = 0.0
+
+        if horas_total_operacao > 0 and horas_trabalho_dia > 0:
+            total_dias = horas_total_operacao / horas_trabalho_dia
+        else:
+            total_dias = 0.0
+
+        # Fim da operação = início + total_dias (arredondado)
+        if isinstance(inicio_operacao, datetime.date):
+            fim_operacao = inicio_operacao + datetime.timedelta(days=int(round(total_dias)))
+        else:
+            fim_operacao = None
+
+        # Hectare por dia da máquina de referência (base)
+        hectare_por_dia_ref = hectare_hora_ref * horas_trabalho_dia
+
+        if hectare_ano_ref <= 0 or hectare_hora_ref <= 0:
+            st.warning("Verifique os parâmetros da página 1 (Hectare médio por ano, Hectares por hora e largura).")
+
+        st.markdown("---")
+
+        # ---------------- Escopo: Chassi específico x Frota inteira ----------------
+        if "escopo_operacional" not in st.session_state:
+            st.session_state["escopo_operacional"] = "Chassi específico"
+
+        escopo_label = st.radio(
+            "Escopo para cálculo das quantidades:",
+            ["Chassi específico", "Frota inteira"],
+            horizontal=True,
+            index=(0 if st.session_state["escopo_operacional"] == "Chassi específico" else 1)
+        )
+        st.session_state["escopo_operacional"] = escopo_label
+
+        df_pecas = st.session_state["df_pecas_proc"].copy()
+        df_maqs_all = st.session_state["df_maquinas_proc"].copy()
+        df_maqs_all["Chassi"] = df_maqs_all["Chassi"].astype(str)
+        chassi_sel = st.session_state.get("chassi_selecionado")
+
+        if escopo_label == "Chassi específico":
+            if chassi_sel and chassi_sel != "Todos":
+                df_maqs_local = df_maqs_all[df_maqs_all["Chassi"] == str(chassi_sel)]
+            else:
+                df_maqs_local = df_maqs_all.sort_values(by="Chassi").head(1)
+        else:
+            # Frota inteira -> todos os chassis do modelo já filtrados em df_maquinas_proc
+            df_maqs_local = df_maqs_all.copy()
+
+        if df_maqs_local.empty:
+            st.warning("Não há chassis disponíveis para o escopo selecionado.")
+        else:
+            # ---------------- Resumo operacional (com Hectare total e escopo) ----------------
+            # Calcula Hectare por dia conforme o escopo
+            if escopo_label == "Chassi específico":
+                # Não soma: usa apenas a máquina de referência
+                hectare_por_dia = hectare_por_dia_ref
+            else:
+                # Frota inteira: soma Hectare por dia de cada máquina do escopo
+                hectare_por_dia = 0.0
+                for _, m in df_maqs_local.iterrows():
+                    ha_hora_maq = float(m.get("ha_hora_chassi", 0.0) or 0.0)
+                    hectare_por_dia += ha_hora_maq * horas_trabalho_dia
+
+            # Hectare total = Total de dias * Hectare por dia (respeitando escopo)
+            hectare_total = total_dias * hectare_por_dia
+
+            st.markdown("### Resumo operacional (máquina de referência)")
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                st.metric(
+                    "Horas total de operação",
+                    f"{horas_total_operacao:.2f}"
+                )
+            with c2:
+                st.metric(
+                    "Total de dias",
+                    f"{total_dias:.2f}"
+                )
+            with c3:
+                st.metric(
+                    "Hectare por dia",
+                    f"{hectare_por_dia:.2f}"
+                )
+            with c4:
+                st.metric(
+                    "Hectare total",
+                    f"{hectare_total:.2f}"
+                )
+
+            col_d1, col_d2 = st.columns(2)
+            inicio_str = (
+                inicio_operacao.strftime("%d/%m/%Y")
+                if isinstance(inicio_operacao, datetime.date) else "-"
+            )
+            fim_str = (
+                fim_operacao.strftime("%d/%m/%Y")
+                if isinstance(fim_operacao, datetime.date) else "-"
+            )
+            with col_d1:
+                st.write(f"**Início da operação:** {inicio_str}")
+            with col_d2:
+                st.write(f"**Fim da operação (ref.):** {fim_str}")
+
+            if horas_trabalho_dia <= 0:
+                st.warning("Informe um valor positivo em 'Horas de trabalho por dia' para gerar o calendário.")
+            else:
+                linhas_calendario = []
+
+                # ---------- Geração de eventos por máquina + peça ----------
+                for _, m in df_maqs_local.iterrows():
+                    ha_ano_maq = float(m.get("ha_ano_chassi", 0.0) or 0.0)
+                    ha_hora_maq = float(m.get("ha_hora_chassi", 0.0) or 0.0)
+                    n_linhas_maq = int(m.get("Linhas", 1) or 1)
+
+                    if ha_ano_maq <= 0 or ha_hora_maq <= 0:
+                        continue
+
+                    hectare_por_dia_maq = ha_hora_maq * horas_trabalho_dia
+                    if hectare_por_dia_maq <= 0:
+                        continue
+
+                    for _, row_p in df_pecas.iterrows():
+                        try:
+                            cod = format_codigo(row_p["Código"])
+                            fam = row_p["Família"]
+                            desc = row_p["Descrição"]
+                            vida_base = float(row_p["hectare_proporcao_efetivo"])
+                            qtd_por_prop = float(row_p["Qtd/Proporção"])
+                            prop_troca = float(row_p["proporcao_troca_%"])
+                            tipo_prop = str(row_p["Proporção"]).strip().lower()
+                            custo_unit = float(row_p.get("custo_unitario", 0.0) or 0.0)
+                        except Exception:
+                            continue
+
+                        if vida_base <= 0 or qtd_por_prop <= 0 or prop_troca <= 0:
+                            continue
+
+                        # vida_total e quantidade por ciclo (teórica)
+                        if tipo_prop == "linha":
+                            vida_total_ha = vida_base * n_linhas_maq
+                            qtd_ciclo_teorico = qtd_por_prop * n_linhas_maq
+                        else:
+                            vida_total_ha = vida_base
+                            qtd_ciclo_teorico = qtd_por_prop
+
+                        if vida_total_ha <= 0 or qtd_ciclo_teorico <= 0:
+                            continue
+
+                        # Quantidade recomendada para ESSA máquina, usando mesma lógica central
+                        qtd_recomendada_maq = _quantidade_para_maquina_especifica(row_p, ha_ano_maq, n_linhas_maq)
+                        if qtd_recomendada_maq <= 0:
+                            continue
+
+                        # Quantidade "cheia" recomendada em cada ciclo (já considerando proporção de troca)
+                        qtd_evento_cheio = qtd_ciclo_teorico * (prop_troca / 100.0)
+                        if qtd_evento_cheio <= 0:
+                            # fallback simples: tudo em um único evento na data inicial
+                            quantidades = [qtd_recomendada_maq]
+                            dias_por_ciclo = 0.0
+                        else:
+                            n_cheios = int(qtd_recomendada_maq // qtd_evento_cheio)
+                            resto = float(qtd_recomendada_maq - n_cheios * qtd_evento_cheio)
+
+                            quantidades = [qtd_evento_cheio] * n_cheios
+                            if resto > 1e-6:
+                                quantidades.append(resto)
+
+                            if not quantidades:
+                                quantidades = [qtd_recomendada_maq]
+
+                            dias_por_ciclo = vida_total_ha / hectare_por_dia_maq if hectare_por_dia_maq > 0 else 0.0
+
+                        # Gera eventos para esta máquina e esta peça
+                        for idx, q_evt in enumerate(quantidades):
+                            if isinstance(inicio_operacao, datetime.date):
+                                if dias_por_ciclo > 0:
+                                    dias_offset = dias_por_ciclo * (idx + 1)
+                                else:
+                                    dias_offset = 0.0
+                                data_evt = inicio_operacao + datetime.timedelta(days=int(round(dias_offset)))
+                                data_troca_str = data_evt.strftime("%m/%Y")
+                            else:
+                                data_evt = None
+                                data_troca_str = ""
+
+                            custo_evt = q_evt * custo_unit
+
+                            linhas_calendario.append({
+                                "Família": fam,
+                                "Código": cod,
+                                "Descrição": desc,
+                                "Data troca": data_troca_str,
+                                "Quantidade peça": q_evt,
+                                "Custo": custo_evt
+                            })
+
+                # ---------- AGREGAÇÃO POR Data troca / Código / Família ----------
+                df_cal = pd.DataFrame(linhas_calendario)
+
+                if not df_cal.empty:
+                    group_cols = ["Família", "Código", "Descrição", "Data troca"]
+                    df_cal = (
+                        df_cal
+                        .groupby(group_cols, as_index=False)
+                        .agg({
+                            "Quantidade peça": "sum",
+                            "Custo": "sum"
+                        })
+                    )
+
+                    # Converte "Data troca" (mm/aaaa) para datetime (01/mm/aaaa) para ordenar corretamente
+                    df_cal["Data troca"] = pd.to_datetime(
+                        "01/" + df_cal["Data troca"].astype(str),
+                        format="%d/%m/%Y",
+                        errors="coerce"
+                    )
+                    # Remove linhas inválidas e ordena por data
+                    df_cal = df_cal.dropna(subset=["Data troca"])
+                    df_cal = df_cal.sort_values("Data troca").reset_index(drop=True)
+
+                    # Arredonda quantidade para visualização
+                    df_cal["Quantidade peça"] = df_cal["Quantidade peça"].round(0)
+
+                    # ---------------- Filtros (Família + campo livre, similar páginas 2 e 3) ----------------
+                    familias_p4 = sorted(df_cal["Família"].dropna().unique().tolist())
+                    familias_dropdown_p4 = ["Todos"] + familias_p4
+
+                    if "filtro_familia_p4" not in st.session_state:
+                        st.session_state["filtro_familia_p4"] = "Todos"
+                    if "filtro_campo_p4" not in st.session_state:
+                        st.session_state["filtro_campo_p4"] = "Todos"
+                    if "filtro_valor_p4" not in st.session_state:
+                        st.session_state["filtro_valor_p4"] = ""
+
+                    col_f1, col_f2, col_f3 = st.columns([1.2, 1.2, 2])
+                    with col_f1:
+                        st.session_state["filtro_familia_p4"] = st.selectbox(
+                            "Família",
+                            familias_dropdown_p4,
+                            index=(
+                                familias_dropdown_p4.index(st.session_state["filtro_familia_p4"])
+                                if st.session_state["filtro_familia_p4"] in familias_dropdown_p4
+                                else 0
+                            )
+                        )
+                    with col_f2:
+                        st.session_state["filtro_campo_p4"] = st.selectbox(
+                            "Filtrar por campo",
+                            ["Todos", "Código", "Descrição", "Data troca"],
+                            index=(
+                                ["Todos", "Código", "Descrição", "Data troca"].index(st.session_state["filtro_campo_p4"])
+                                if st.session_state["filtro_campo_p4"] in ["Todos", "Código", "Descrição", "Data troca"]
+                                else 0
+                            )
+                        )
+                    with col_f3:
+                        st.session_state["filtro_valor_p4"] = st.text_input(
+                            "Valor do filtro (contém)",
+                            value=st.session_state["filtro_valor_p4"]
+                        )
+
+                    # Aplica filtro de família
+                    fam_sel_p4 = st.session_state["filtro_familia_p4"]
+                    if fam_sel_p4 != "Todos":
+                        df_cal = df_cal[df_cal["Família"] == fam_sel_p4]
+
+                    # Aplica filtro de texto
+                    filtro_txt_p4 = st.session_state["filtro_valor_p4"].strip().lower()
+                    campo_p4 = st.session_state["filtro_campo_p4"]
+
+                    if filtro_txt_p4:
+                        if campo_p4 == "Todos":
+                            mask = (
+                                df_cal["Código"].astype(str).str.lower().str.contains(filtro_txt_p4)
+                                | df_cal["Descrição"].astype(str).str.lower().str.contains(filtro_txt_p4)
+                                | df_cal["Data troca"].dt.strftime("%m/%Y").str.lower().str.contains(filtro_txt_p4)
+                            )
+                        elif campo_p4 == "Código":
+                            mask = df_cal["Código"].astype(str).str.lower().str.contains(filtro_txt_p4)
+                        elif campo_p4 == "Descrição":
+                            mask = df_cal["Descrição"].astype(str).str.lower().str.contains(filtro_txt_p4)
+                        else:  # Data troca
+                            mask = df_cal["Data troca"].dt.strftime("%m/%Y").str.lower().str.contains(filtro_txt_p4)
+                        df_cal = df_cal[mask]
+
+                    st.markdown("### Calendário de trocas projetado")
+
+                    st.dataframe(
+                        df_cal,
+                        column_config={
+                            "Família": st.column_config.TextColumn("Família"),
+                            "Código": st.column_config.TextColumn("Código"),
+                            "Descrição": st.column_config.TextColumn("Descrição"),
+                            "Data troca": st.column_config.DateColumn("Data troca (mm/aaaa)", format="MM/YYYY"),
+                            "Quantidade peça": st.column_config.NumberColumn("Quantidade peça", format="%.0f"),
+                            "Custo": st.column_config.NumberColumn("Custo (R$)", format="R$ %.2f"),
+                        },
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+
+                    # ---------------- Exportar tabela da página 4 ----------------
+                    if not df_cal.empty:
+                        # Cria uma cópia para export, mantendo as colunas iguais
+                        df_export_p4 = df_cal.copy()
+                        buffer_p4 = BytesIO()
+                        with pd.ExcelWriter(buffer_p4, engine="xlsxwriter") as writer:
+                            df_export_p4.to_excel(writer, index=False, sheet_name="Analise_operacional")
+                        buffer_p4.seek(0)
+
+                        st.download_button(
+                            label="Exportar tabela da análise operacional (Excel)",
+                            data=buffer_p4,
+                            file_name="analise_operacional.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True
+                        )
+
+                    # ---------------- Gráfico de colunas ----------------
+                    if not df_cal.empty:
+                        st.markdown("### Gráfico de trocas por mês/ano")
+
+                        metrica_graf = st.radio(
+                            "Métrica do gráfico",
+                            ["Quantidade de peças", "Custo (R$)"],
+                            horizontal=True
+                        )
+
+                        if metrica_graf == "Quantidade de peças":
+                            y_col = "Quantidade peça"
+                            y_title = "Quantidade de peças"
+                        else:
+                            y_col = "Custo"
+                            y_title = "Custo (R$)"
+
+                        chart_data = df_cal.copy()
+                        # Colunas formatadas para tooltip
+                        chart_data["Quantidade_str"] = chart_data["Quantidade peça"].apply(
+                            lambda x: f"{int(round(x))}"
+                        )
+                        chart_data["Custo_str"] = chart_data["Custo"].apply(format_currency)
+                        # NOVO: rótulo categórico mm/aaaa para usar apenas datas que têm informação
+                        chart_data["DataLabel"] = chart_data["Data troca"].dt.strftime("%m/%Y")
+
+                        chart = (
+                            alt.Chart(chart_data)
+                            .mark_bar()
+                            .encode(
+                                x=alt.X(
+                                    "DataLabel:N",
+                                    title="Mês/Ano",
+                                    sort=alt.SortField(field="Data troca", order="ascending")
+                                ),
+                                y=alt.Y(f"{y_col}:Q", title=y_title),
+                                tooltip=[
+                                    alt.Tooltip("DataLabel:N", title="Mês/Ano"),
+                                    alt.Tooltip("Quantidade_str:N", title="Quantidade"),
+                                    alt.Tooltip("Custo_str:N", title="Custo"),
+                                ]
+                            )
+                            .interactive()
+                        )
+
+                        st.altair_chart(chart, use_container_width=True)
+                else:
+                    st.info("Nenhum evento de troca foi gerado com os parâmetros atuais.")
