@@ -1277,6 +1277,7 @@ elif pagina == "2. Ajustes de Peças":
                 synced_hect = float(st.session_state[key_hect])
                 synced_ref = float(st.session_state[key_ref])
 
+                # Calcula vida_total (Hectare referência) e quantidade prevista
                 vida_total, qtd_prevista = calcular_hect_ref_e_qtd_prevista(
                     row,
                     resumo_ref,
@@ -1291,6 +1292,14 @@ elif pagina == "2. Ajustes de Peças":
                 st.write(f"Qtd/Proporção: {row['Qtd/Proporção']}")
                 st.write(f"Hectare/Proporção (original): {format_hectare_original(row['Hectare/Proporção'])}")
                 st.write(f"Linhas do chassi (ref): {n_linhas_ref}")
+
+                # NOVO: Horas = Hectare referência (vida_total) / Hectares por hora da máquina de referência
+                ha_hora_maquina = float(resumo_ref.get("ha_hora_maquina", 0.0) or 0.0)
+                if ha_hora_maquina > 0:
+                    horas_peca = vida_total / ha_hora_maquina
+                    st.write(f"Horas: {horas_peca:.2f}")
+                else:
+                    st.write("Horas: n/d")
 
             if cD is not None and img_url:
                 with cD:
@@ -1920,11 +1929,11 @@ elif pagina == "4. Análise operacional":
                                     sort=alt.SortField(field="Data troca", order="ascending")
                                 ),
                                 y=alt.Y(f"{y_col}:Q", title=y_title),
-                                tooltip=[
-                                    alt.Tooltip("DataLabel:N", title="Mês/Ano"),
-                                    alt.Tooltip("Quantidade_str:N", title="Quantidade"),
-                                    alt.Tooltip("Custo_str:N", title="Custo"),
-                                ]
+                                    tooltip=[
+                                        alt.Tooltip("DataLabel:N", title="Mês/Ano"),
+                                        alt.Tooltip("Quantidade_str:N", title="Quantidade"),
+                                        alt.Tooltip("Custo_str:N", title="Custo"),
+                                    ]
                             )
                             .interactive()
                         )
