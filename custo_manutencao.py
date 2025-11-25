@@ -47,12 +47,6 @@ def init_session_state():
         "filtro_valor_resumo": "",
 
         # Persistência dos ajustes por Código
-        # {"00001234": {
-        #    "hect": float|None, "prop": int|None,
-        #    "manual_hect": bool, "manual_prop": bool,
-        #    "modo_qtd": "Proporcional"/"Inteiro" ou None,
-        #    "manual_modo": bool
-        # }}
         "ajustes_pecas": {},
 
         # Assinatura do processamento para evitar reconstrução desnecessária
@@ -69,6 +63,9 @@ def init_session_state():
 
         # Modo global de cálculo da quantidade recomendada
         "modo_calculo_qtd": "Proporcional",
+
+        # NOVO: considerar anos anteriores ou apenas ano atual
+        "considerar_anos": "Considerar ano atual",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -188,9 +185,13 @@ def processar_maquinas(
             "horas_maquina_ano": 0.0,
             "n_chassis_frota": 0,
             "modelo": modelo_escolhido,
+            "largura_maquina_m": 0.0,
+            "anos_uso_maquina": 1,
+            "considerar_anos": st.session_state.get("considerar_anos", "Considerar ano atual"),
         }
         return pd.DataFrame(), resumo_ref
 
+    # Largura total por chassi
     df["largura_total_m"] = (df["Linhas"] * df["Espaçamento"]) / 100.0
 
     if largura_ref_m and largura_ref_m != 0:
@@ -203,6 +204,42 @@ def processar_maquinas(
     df["ha_hora_chassi"] = df["largura_total_m"] * ha_hora_por_metro_ref
     df["ha_ano_chassi"] = df["largura_total_m"] * ha_ano_por_metro_ref
     df["horas_chassi_ano"] = df["ha_ano_chassi"] / df["ha_hora_chassi"]
+
+    # ------------------ Anos de uso ------------------
+    considerar_anos_flag = st.session_state.get("considerar_anos", "Considerar ano atual")
+    current_year = datetime.date.today().year
+
+    if "Ano" not in df.columns:
+        df["Ano"] = np.nan
+
+    df["Ano"] = pd.to_numeric(df["Ano"], errors="coerce")
+
+    if considerar_anos_flag == "Considerar anos anteriores":
+        # anos_uso = (ano_atual - Ano) + 1, apenas se Ano <= ano_atual
+        df["anos_uso"] = np.where(
+            df["Ano"].notna() & (df["Ano"] <= current_year),
+            (current_year - df["Ano"]).astype(int) + 1,
+            np.nan
+        )
+        # Desconsidera máquinas sem ano ou com ano futuro
+        df = df[df["anos_uso"].notna() & (df["anos_uso"] >= 1)]
+        if df.empty:
+            resumo_ref = {
+                "chassi_ref": chassi_ref_escolhido if chassi_ref_escolhido else None,
+                "linhas_maquina": 0,
+                "ha_ano_maquina": 0.0,
+                "ha_hora_maquina": 0.0,
+                "horas_maquina_ano": 0.0,
+                "n_chassis_frota": 0,
+                "modelo": modelo_escolhido,
+                "largura_maquina_m": 0.0,
+                "anos_uso_maquina": 1,
+                "considerar_anos": considerar_anos_flag,
+            }
+            return pd.DataFrame(), resumo_ref
+    else:
+        # Ignora ano: trata todas como ano de uso = 1
+        df["anos_uso"] = 1
 
     df_sorted = df.sort_values(by="Chassi").reset_index(drop=True)
     chassis_lista = df_sorted["Chassi"].astype(str).tolist()
@@ -217,6 +254,8 @@ def processar_maquinas(
 
     linha_ref = df_sorted[df_sorted["Chassi"].astype(str) == str(usar_chassi_para_calculo)].iloc[0]
     linhas_ref = int(linha_ref["Linhas"])
+    largura_ref_maquina = float(linha_ref.get("largura_total_m", 0.0) or 0.0)
+    anos_uso_ref = int(linha_ref.get("anos_uso", 1) or 1)
 
     resumo_ref = {
         "chassi_ref": chassi_ref_escolhido,
@@ -226,6 +265,9 @@ def processar_maquinas(
         "horas_maquina_ano": float(linha_ref["horas_chassi_ano"]) if pd.notna(linha_ref["horas_chassi_ano"]) else 0.0,
         "n_chassis_frota": int(len(df_sorted)),
         "modelo": modelo_escolhido,
+        "largura_maquina_m": largura_ref_maquina,
+        "anos_uso_maquina": anos_uso_ref,
+        "considerar_anos": considerar_anos_flag,
     }
 
     return df_sorted, resumo_ref
@@ -262,11 +304,18 @@ def _modo_qtd_para_codigo(row_or_codigo):
 
 # -------- helper: cálculo por máquina específica --------
 
-def _quantidade_para_maquina_especifica(row, ha_ano_maquina, n_linhas_maquina):
+def _quantidade_para_maquina_especifica(row, ha_ano_maquina, n_linhas_maquina, anos_uso=1):
     """
     Calcula a quantidade recomendada de uma peça para UMA máquina específica,
-    usando os parâmetros dessa máquina (hectares/ano e nº de linhas).
-    Respeita modo global e overrides por peça.
+    usando os parâmetros dessa máquina (hectares/ano e nº de linhas) e,
+    opcionalmente, considerando anos anteriores.
+
+    - Para "Considerar ano atual": usa apenas ha_ano_maquina (lógica original).
+    - Para "Considerar anos anteriores" + modo Inteiro:
+        conta somente os ciclos que "rompem" dentro do ano atual.
+    - Para "Considerar anos anteriores" + modo Proporcional:
+        conta (ciclos completos dentro do ano) + fração do ciclo em andamento
+        ao final do ano atual (ex.: 3 trocas + fração proporcional ao restante).
     """
     try:
         vida_base = float(row["hectare_proporcao_efetivo"])  # durabilidade ajustada
@@ -282,6 +331,9 @@ def _quantidade_para_maquina_especifica(row, ha_ano_maquina, n_linhas_maquina):
     ha_ano = float(ha_ano_maquina or 0.0)
     n_linhas = int(n_linhas_maquina or 1)
 
+    if ha_ano <= 0:
+        return 0.0
+
     if tipo_prop == "linha":
         vida_total = vida_base * n_linhas
         qtd_total_por_ciclo = qtd_por_prop * n_linhas
@@ -293,12 +345,30 @@ def _quantidade_para_maquina_especifica(row, ha_ano_maquina, n_linhas_maquina):
         return 0.0
 
     modo_qtd = _modo_qtd_para_codigo(row)
+    considerar_anos_flag = st.session_state.get("considerar_anos", "Considerar ano atual")
 
-    ciclos_raw = ha_ano / vida_total
-    if modo_qtd == "Inteiro":
-        ciclos = np.floor(ciclos_raw)
+    if considerar_anos_flag == "Considerar anos anteriores" and anos_uso >= 1:
+        # Hectares acumulados até o início e até o fim do ano atual
+        start_prev = (anos_uso - 1) * ha_ano
+        end_current = anos_uso * ha_ano
+
+        if modo_qtd == "Inteiro":
+            # Apenas ciclos completos que "rompem" dentro do ano atual
+            ciclos_ini = np.floor(start_prev / vida_total)
+            ciclos_fim = np.floor(end_current / vida_total)
+            ciclos = max(0.0, ciclos_fim - ciclos_ini)
+        else:
+            # Proporcional: ciclos completos no ano + fração do ciclo em andamento
+            x0 = start_prev / vida_total
+            x1 = end_current / vida_total
+            ciclos = max(0.0, x1 - np.floor(x0))
     else:
-        ciclos = ciclos_raw
+        # Lógica "por ano" (para ano atual ou quando não considera anos anteriores)
+        ciclos_raw = ha_ano / vida_total
+        if modo_qtd == "Inteiro":
+            ciclos = np.floor(ciclos_raw)
+        else:
+            ciclos = ciclos_raw
 
     consumo_teorico = ciclos * qtd_total_por_ciclo
     qtd_rec = consumo_teorico * (prop_troca / 100.0)
@@ -312,7 +382,8 @@ def _quantidade_recomendada_uma_maquina(row, resumo_maquina_ref):
     """
     ha_ano = float(resumo_maquina_ref.get("ha_ano_maquina", 0.0) or 0.0)
     n_linhas = int(resumo_maquina_ref.get("linhas_maquina", 1) or 1)
-    return _quantidade_para_maquina_especifica(row, ha_ano, n_linhas)
+    anos_uso_ref = int(resumo_maquina_ref.get("anos_uso_maquina", 1) or 1)
+    return _quantidade_para_maquina_especifica(row, ha_ano, n_linhas, anos_uso_ref)
 
 
 # ---------------- REAPLICAÇÃO DE AJUSTES (respeita apenas o que foi MANUAL) ----------------
@@ -359,9 +430,31 @@ def construir_df_pecas(df_pecas, df_custos, resumo_maquina_ref, modo_operacao):
 
     df = dfp.merge(dfc[["Código", "Custo"]], on="Código", how="left")
 
-    # Base inicial (afetada por modo e multiplicadores)
-    df["hectare_proporcao_efetivo"] = df["Hectare/Proporção"].apply(
-        lambda x: aplicar_modo_operacao(x, st.session_state["modo_operacao"])
+    # ---------------- Ajuste de Hectare/Proporção para Proporção = Máquina ----------------
+    largura_ref = st.session_state.get("largura_ref_m") or 0.0
+    largura_maquina_ref = float(resumo_maquina_ref.get("largura_maquina_m", 0.0) or 0.0)
+
+    if largura_ref and largura_maquina_ref:
+        fator_largura = largura_maquina_ref / largura_ref
+    else:
+        fator_largura = 1.0
+
+    def _ajustar_hect_por_largura(row):
+        try:
+            val = float(row["Hectare/Proporção"])
+        except Exception:
+            return 0.0
+        prop_str = str(row.get("Proporção", "")).strip().lower()
+        # Para Proporção = Máquina, escala pela relação de larguras
+        if prop_str in ["máquina", "maquina"]:
+            val = val * fator_largura
+        # Para Proporção = Linhas, mantém como está (vida por linha será tratada depois)
+        return val
+
+    # Base inicial (afetada por modo e multiplicadores + largura para Proporção=Máquina)
+    df["hectare_proporcao_efetivo"] = df.apply(
+        lambda r: aplicar_modo_operacao(_ajustar_hect_por_largura(r), st.session_state["modo_operacao"]),
+        axis=1
     )
 
     # Proporção padrão global (pode ser mudada manualmente por item na página 2)
@@ -411,7 +504,8 @@ def recalcular_pecas_pos_ajuste(df_pecas_proc, resumo_maquina_ref):
 
 def agregar_para_exportacao(df_pecas_proc, resumo_maquina_ref, familia_filter="Todos", escopo="Apenas chassi selecionado"):
     """
-    Agora calcula quantidade 'somando por chassi' de verdade, respeitando modo de cálculo.
+    Agora calcula quantidade 'somando por chassi' de verdade, respeitando modo de cálculo
+    e, quando configurado, anos de uso das máquinas.
     """
     if df_pecas_proc is None or df_pecas_proc.empty:
         return pd.DataFrame(columns=["Código", "Descrição", "Família", "Qtd recomendada", "Custo total"])
@@ -455,7 +549,8 @@ def agregar_para_exportacao(df_pecas_proc, resumo_maquina_ref, familia_filter="T
             for _, m in df_maqs_local.iterrows():
                 ha_ano_maq = float(m.get("ha_ano_chassi", 0.0) or 0.0)
                 n_linhas_maq = int(m.get("Linhas", 1) or 1)
-                qtd_maq = _quantidade_para_maquina_especifica(p, ha_ano_maq, n_linhas_maq)
+                anos_uso_maq = int(m.get("anos_uso", 1) or 1)
+                qtd_maq = _quantidade_para_maquina_especifica(p, ha_ano_maq, n_linhas_maq, anos_uso_maq)
                 qtd_total_frota += qtd_maq
 
             qts.append(qtd_total_frota)
@@ -580,6 +675,10 @@ def calcular_hect_ref_e_qtd_prevista(
 
     Se modo_qtd_atual for informado (página 2), usa esse modo.
     Se não, busca modo em ajustes_pecas/global via _modo_qtd_para_codigo.
+
+    Quando "Considerar anos anteriores" está ativo, utiliza também anos_uso_maquina
+    para separar o que aconteceu antes e dentro do ano atual, tanto no modo Inteiro
+    quanto no Proporcional (ex.: 3 trocas + parte proporcional ao restante).
     """
     try:
         tipo_prop = str(row["Proporção"]).strip().lower()
@@ -588,8 +687,11 @@ def calcular_hect_ref_e_qtd_prevista(
         ha_ano = float(resumo_maquina_ref.get("ha_ano_maquina", 0.0) or 0.0)
         vida_base = float(hectare_efetivo_atual)
         prop_troca = float(proporcao_troca_atual)
+        anos_uso_ref = int(resumo_maquina_ref.get("anos_uso_maquina", 1) or 1)
     except Exception:
         return 0.0, 0.0
+
+    considerar_anos_flag = st.session_state.get("considerar_anos", "Considerar ano atual")
 
     if tipo_prop == "linha":
         vida_total = vida_base * n_linhas
@@ -604,11 +706,25 @@ def calcular_hect_ref_e_qtd_prevista(
         else:
             modo_qtd = _modo_qtd_para_codigo(row)
 
-        ciclos_raw = ha_ano / vida_total
-        if modo_qtd == "Inteiro":
-            ciclos = np.floor(ciclos_raw)
+        if considerar_anos_flag == "Considerar anos anteriores" and anos_uso_ref >= 1:
+            # Mesma lógica usada em _quantidade_para_maquina_especifica
+            start_prev = (anos_uso_ref - 1) * ha_ano
+            end_current = anos_uso_ref * ha_ano
+
+            if modo_qtd == "Inteiro":
+                ciclos_ini = np.floor(start_prev / vida_total)
+                ciclos_fim = np.floor(end_current / vida_total)
+                ciclos = max(0.0, ciclos_fim - ciclos_ini)
+            else:
+                x0 = start_prev / vida_total
+                x1 = end_current / vida_total
+                ciclos = max(0.0, x1 - np.floor(x0))
         else:
-            ciclos = ciclos_raw
+            ciclos_raw = ha_ano / vida_total
+            if modo_qtd == "Inteiro":
+                ciclos = np.floor(ciclos_raw)
+            else:
+                ciclos = ciclos_raw
 
         consumo_teorico = ciclos * qtd_total_por_ciclo
         qtd_prevista = consumo_teorico * (prop_troca / 100.0)
@@ -777,6 +893,7 @@ def _assinatura_atual():
         st.session_state.get("largura_ref_m"),
         st.session_state.get("modo_operacao"),
         st.session_state.get("modo_calculo_qtd"),
+        st.session_state.get("considerar_anos"),
         float(mults.get("Leve", 1.5)),
         float(mults.get("Moderado", 1.0)),
         float(mults.get("Extremo", 0.6)),
@@ -797,7 +914,8 @@ def _pode_processar():
 def run_processamento_if_needed(show_msg=False):
     """
     Reprocessa máquinas e peças quando a assinatura mudar.
-    Inclui modo_calculo_qtd, então mudar Proporcional/Inteiro na página 1
+    Inclui modo_calculo_qtd e considerar_anos, então mudar Proporcional/Inteiro
+    na página 1 ou alternar entre 'ano atual' e 'anos anteriores'
     força reprocessamento.
     Também reseta os rádios de modo das peças que NÃO são manuais.
     """
@@ -828,7 +946,7 @@ def run_processamento_if_needed(show_msg=False):
 
         st.session_state["assinatura_processamento"] = nova_assinatura
 
-        # NOVO: sincroniza os rádios de modo com o global para quem NÃO é manual
+        # sincroniza os rádios de modo com o global para quem NÃO é manual
         ajustes = st.session_state.get("ajustes_pecas", {})
         for cod, vals in ajustes.items():
             if not vals.get("manual_modo", False):
@@ -1014,6 +1132,18 @@ if pagina == "1. Entrada de Dados":
         )
     )
 
+    # NOVO: horizonte de cálculo (anos anteriores x ano atual)
+    st.markdown("---")
+    st.subheader("Horizonte de cálculo (vida útil das máquinas)")
+    st.session_state["considerar_anos"] = st.radio(
+        "Como considerar o ano das máquinas?",
+        ["Considerar ano atual", "Considerar anos anteriores"],
+        horizontal=True,
+        index=(
+            0 if st.session_state["considerar_anos"] == "Considerar ano atual" else 1
+        )
+    )
+
     # NOVO: modo de cálculo da quantidade
     st.markdown("---")
     st.subheader("Modo de cálculo da quantidade de peças")
@@ -1051,6 +1181,13 @@ elif pagina == "2. Ajustes de Peças":
     ):
         st.warning("Primeiro importe os dados e processe na página '1. Entrada de Dados'.")
     else:
+        resumo_ref = st.session_state["resumo_maquina_ref"]
+        # NOVO: mostrar chassi de referência na página 2
+        st.write(
+            f"Modelo: {resumo_ref.get('modelo','-')} • Chassi ref: {resumo_ref.get('chassi_ref','-')} "
+            f"• Linhas: {resumo_ref.get('linhas_maquina','?')} • Frota (modelo): {resumo_ref.get('n_chassis_frota', 1)}"
+        )
+
         st.write("Edite os parâmetros peça a peça. Esses ajustes alimentam os cálculos finais.")
         st.write("Os valores **permanecem salvos** ao alternar páginas; só se perdem ao recarregar o app ou importar novas tabelas.")
 
@@ -1158,7 +1295,6 @@ elif pagina == "2. Ajustes de Peças":
 
         updated_rows = []
         ajustes = st.session_state["ajustes_pecas"]
-        resumo_ref = st.session_state["resumo_maquina_ref"]
         n_linhas_ref = int(resumo_ref.get("linhas_maquina", 1) or 1)
 
         def cb_from_hect(kh, kr, tipo_lower, nlin):
@@ -1293,7 +1429,7 @@ elif pagina == "2. Ajustes de Peças":
                 st.write(f"Hectare/Proporção (original): {format_hectare_original(row['Hectare/Proporção'])}")
                 st.write(f"Linhas do chassi (ref): {n_linhas_ref}")
 
-                # NOVO: Horas = Hectare referência (vida_total) / Hectares por hora da máquina de referência
+                # Horas = Hectare referência (vida_total) / Hectares por hora da máquina de referência
                 ha_hora_maquina = float(resumo_ref.get("ha_hora_maquina", 0.0) or 0.0)
                 if ha_hora_maquina > 0:
                     horas_peca = vida_total / ha_hora_maquina
@@ -1683,11 +1819,14 @@ elif pagina == "4. Análise operacional":
             else:
                 linhas_calendario = []
 
+                considerar_anos_flag = st.session_state.get("considerar_anos", "Considerar ano atual")
+
                 # ---------- Geração de eventos por máquina + peça ----------
                 for _, m in df_maqs_local.iterrows():
                     ha_ano_maq = float(m.get("ha_ano_chassi", 0.0) or 0.0)
                     ha_hora_maq = float(m.get("ha_hora_chassi", 0.0) or 0.0)
                     n_linhas_maq = int(m.get("Linhas", 1) or 1)
+                    anos_uso_maq = int(m.get("anos_uso", 1) or 1)
 
                     if ha_ano_maq <= 0 or ha_hora_maq <= 0:
                         continue
@@ -1695,6 +1834,13 @@ elif pagina == "4. Análise operacional":
                     hectare_por_dia_maq = ha_hora_maq * horas_trabalho_dia
                     if hectare_por_dia_maq <= 0:
                         continue
+
+                    # Hectares acumulados antes do ano atual e dentro do ano atual
+                    if considerar_anos_flag == "Considerar anos anteriores" and anos_uso_maq > 1:
+                        start_prev_ha = (anos_uso_maq - 1) * ha_ano_maq
+                    else:
+                        start_prev_ha = 0.0
+                    end_current_ha = start_prev_ha + ha_ano_maq
 
                     for _, row_p in df_pecas.iterrows():
                         try:
@@ -1723,35 +1869,56 @@ elif pagina == "4. Análise operacional":
                         if vida_total_ha <= 0 or qtd_ciclo_teorico <= 0:
                             continue
 
-                        # Quantidade recomendada para ESSA máquina, usando mesma lógica central
-                        qtd_recomendada_maq = _quantidade_para_maquina_especifica(row_p, ha_ano_maq, n_linhas_maq)
+                        # Quantidade recomendada para ESSA máquina (ano atual), usando lógica de anos_uso
+                        qtd_recomendada_maq = _quantidade_para_maquina_especifica(
+                            row_p, ha_ano_maq, n_linhas_maq, anos_uso_maq
+                        )
                         if qtd_recomendada_maq <= 0:
                             continue
 
                         # Quantidade "cheia" recomendada em cada ciclo (já considerando proporção de troca)
-                        qtd_evento_cheio = qtd_ciclo_teorico * (prop_troca / 100.0)
-                        if qtd_evento_cheio <= 0:
+                        q_evento_cheio = qtd_ciclo_teorico * (prop_troca / 100.0)
+                        if q_evento_cheio <= 0:
                             # fallback simples: tudo em um único evento na data inicial
                             quantidades = [qtd_recomendada_maq]
-                            dias_por_ciclo = 0.0
+                            offsets_ha = [0.0]
                         else:
-                            n_cheios = int(qtd_recomendada_maq // qtd_evento_cheio)
-                            resto = float(qtd_recomendada_maq - n_cheios * qtd_evento_cheio)
+                            # Eventos completos (ciclos que "rompem" dentro do ano atual)
+                            k_start = int(np.floor(start_prev_ha / vida_total_ha)) + 1
+                            k_end = int(np.floor(end_current_ha / vida_total_ha))
+                            if k_end >= k_start:
+                                full_ks = list(range(k_start, k_end + 1))
+                            else:
+                                full_ks = []
 
-                            quantidades = [qtd_evento_cheio] * n_cheios
+                            quantidades = []
+                            offsets_ha = []
+
+                            for k in full_ks:
+                                A_k = k * vida_total_ha
+                                offset_ha = A_k - start_prev_ha
+                                offsets_ha.append(offset_ha)
+                                quantidades.append(q_evento_cheio)
+
+                            total_full = sum(quantidades) if quantidades else 0.0
+                            resto = float(qtd_recomendada_maq - total_full)
+
+                            # Se houver resto (modo Proporcional ou arredondamentos),
+                            # lança em um último evento no final do ano atual
                             if resto > 1e-6:
                                 quantidades.append(resto)
+                                offsets_ha.append(end_current_ha - start_prev_ha)
 
                             if not quantidades:
+                                # fallback: tudo em um único evento no final do ano
                                 quantidades = [qtd_recomendada_maq]
-
-                            dias_por_ciclo = vida_total_ha / hectare_por_dia_maq if hectare_por_dia_maq > 0 else 0.0
+                                offsets_ha = [end_current_ha - start_prev_ha]
 
                         # Gera eventos para esta máquina e esta peça
-                        for idx, q_evt in enumerate(quantidades):
+                        for q_evt, off_ha in zip(quantidades, offsets_ha):
                             if isinstance(inicio_operacao, datetime.date):
-                                if dias_por_ciclo > 0:
-                                    dias_offset = dias_por_ciclo * (idx + 1)
+                                if hectare_por_dia_maq > 0:
+                                    dias_offset = off_ha / hectare_por_dia_maq
                                 else:
                                     dias_offset = 0.0
                                 data_evt = inicio_operacao + datetime.timedelta(days=int(round(dias_offset)))
@@ -1916,7 +2083,7 @@ elif pagina == "4. Análise operacional":
                             lambda x: f"{int(round(x))}"
                         )
                         chart_data["Custo_str"] = chart_data["Custo"].apply(format_currency)
-                        # NOVO: rótulo categórico mm/aaaa para usar apenas datas que têm informação
+                        # rótulo categórico mm/aaaa para usar apenas datas que têm informação
                         chart_data["DataLabel"] = chart_data["Data troca"].dt.strftime("%m/%Y")
 
                         chart = (
@@ -1929,11 +2096,11 @@ elif pagina == "4. Análise operacional":
                                     sort=alt.SortField(field="Data troca", order="ascending")
                                 ),
                                 y=alt.Y(f"{y_col}:Q", title=y_title),
-                                    tooltip=[
-                                        alt.Tooltip("DataLabel:N", title="Mês/Ano"),
-                                        alt.Tooltip("Quantidade_str:N", title="Quantidade"),
-                                        alt.Tooltip("Custo_str:N", title="Custo"),
-                                    ]
+                                tooltip=[
+                                    alt.Tooltip("DataLabel:N", title="Mês/Ano"),
+                                    alt.Tooltip("Quantidade_str:N", title="Quantidade"),
+                                    alt.Tooltip("Custo_str:N", title="Custo"),
+                                ]
                             )
                             .interactive()
                         )
