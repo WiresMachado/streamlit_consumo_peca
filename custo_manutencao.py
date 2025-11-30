@@ -65,7 +65,10 @@ def init_session_state():
         "modo_calculo_qtd": "Proporcional",
 
         # Horizonte de cálculo (vida útil das máquinas)
-        "considerar_anos": "Considerar ano atual",
+        # Novas opções:
+        # - "Considerar todas as máquinas como novas"
+        # - "Considerar com base no ano e estado"
+        "considerar_anos": "Considerar todas as máquinas como novas",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -148,6 +151,11 @@ def higienizar_custos(df_custos):
 
 
 def higienizar_maquinas(df_maquinas):
+    """
+    Higieniza a tabela de máquinas, incluindo a nova coluna 'Estado',
+    que deve conter 'Usado' ou 'Novo'. Qualquer valor diferente ou ausente
+    será tratado como 'Novo'.
+    """
     dfm = df_maquinas.copy()
     for col in ["Modelo", "Chassi"]:
         if col in dfm.columns:
@@ -155,6 +163,20 @@ def higienizar_maquinas(df_maquinas):
     for col in ["Linhas", "Espaçamento", "Ano"]:
         if col in dfm.columns:
             dfm[col] = pd.to_numeric(dfm[col], errors="coerce")
+
+    # Normaliza coluna Estado (Usado/Novo)
+    if "Estado" in dfm.columns:
+        dfm["Estado"] = (
+            dfm["Estado"]
+            .astype(str)
+            .str.strip()
+            .str.capitalize()
+        )
+        dfm.loc[~dfm["Estado"].isin(["Usado", "Novo"]), "Estado"] = "Novo"
+    else:
+        # Se não existir, cria tudo como Novo
+        dfm["Estado"] = "Novo"
+
     if set(["Modelo", "Chassi"]).issubset(dfm.columns):
         dfm = dfm.drop_duplicates(subset=["Modelo", "Chassi"], keep="first")
     return dfm
@@ -172,6 +194,12 @@ def processar_maquinas(
     Sempre proporcional por largura:
     - hectare_ano_ref e largura_ref_m são a máquina de referência
     - para cada chassi: escala por largura_total_m (Linhas * Espaçamento)
+
+    Horizonte de cálculo:
+    - "Considerar todas as máquinas como novas" => anos_uso = 1 para todas
+    - "Considerar com base no ano e estado":
+        * Estado = "Usado" => anos_uso = (ano_atual - Ano) + 1  (se Ano <= ano_atual)
+        * Estado = "Novo" ou Ano inválido => anos_uso = 1
     """
     df = df_maquinas.copy()
     df = df[df["Modelo"] == modelo_escolhido].copy()
@@ -187,7 +215,7 @@ def processar_maquinas(
             "modelo": modelo_escolhido,
             "largura_maquina_m": 0.0,
             "anos_uso_maquina": 1,
-            "considerar_anos": st.session_state.get("considerar_anos", "Considerar ano atual"),
+            "considerar_anos": st.session_state.get("considerar_anos", "Considerar todas as máquinas como novas"),
         }
         return pd.DataFrame(), resumo_ref
 
@@ -206,7 +234,7 @@ def processar_maquinas(
     df["horas_chassi_ano"] = df["ha_ano_chassi"] / df["ha_hora_chassi"]
 
     # ------------------ Anos de uso ------------------
-    considerar_anos_flag = st.session_state.get("considerar_anos", "Considerar ano atual")
+    considerar_anos_flag = st.session_state.get("considerar_anos", "Considerar todas as máquinas como novas")
     current_year = datetime.date.today().year
 
     if "Ano" not in df.columns:
@@ -214,39 +242,33 @@ def processar_maquinas(
 
     df["Ano"] = pd.to_numeric(df["Ano"], errors="coerce")
 
-    if considerar_anos_flag == "Considerar anos anteriores":
-        # anos_uso = (ano_atual - Ano) + 1, apenas se Ano <= ano_atual
-        df["anos_uso"] = np.where(
-            df["Ano"].notna() & (df["Ano"] <= current_year),
-            (current_year - df["Ano"]).astype(int) + 1,
-            np.nan
-        )
-        # Desconsidera máquinas sem ano ou com ano futuro
-        df = df[df["anos_uso"].notna() & (df["anos_uso"] >= 1)]
-        if df.empty:
-            resumo_ref = {
-                "chassi_ref": chassi_ref_escolhido if chassi_ref_escolhido else None,
-                "linhas_maquina": 0,
-                "ha_ano_maquina": 0.0,
-                "ha_hora_maquina": 0.0,
-                "horas_maquina_ano": 0.0,
-                "n_chassis_frota": 0,
-                "modelo": modelo_escolhido,
-                "largura_maquina_m": 0.0,
-                "anos_uso_maquina": 1,
-                "considerar_anos": considerar_anos_flag,
-            }
-            return pd.DataFrame(), resumo_ref
-    elif considerar_anos_flag == "Considerar anos anteriores e futuros":
-        # Máquinas com Ano <= ano_atual: mesmo cálculo dos anos anteriores
-        # Máquinas com Ano > ano_atual ou Ano ausente: tratadas como novas (anos_uso = 1)
-        df["anos_uso"] = np.where(
-            df["Ano"].notna() & (df["Ano"] <= current_year),
-            (current_year - df["Ano"]).astype(int) + 1,
-            1
-        )
+    if "Estado" not in df.columns:
+        df["Estado"] = "Novo"
     else:
-        # Ignora ano: trata todas como ano de uso = 1
+        df["Estado"] = (
+            df["Estado"]
+            .astype(str)
+            .str.strip()
+            .str.capitalize()
+        )
+        df.loc[~df["Estado"].isin(["Usado", "Novo"]), "Estado"] = "Novo"
+
+    if considerar_anos_flag == "Considerar com base no ano e estado":
+        # Máquinas usadas acumulam anos de uso com base no Ano de fabricação
+        anos_uso_list = []
+        for _, r in df.iterrows():
+            estado = r.get("Estado", "Novo")
+            ano_maq = r.get("Ano", np.nan)
+            if estado == "Usado" and not pd.isna(ano_maq) and ano_maq <= current_year:
+                anos_uso = int(current_year - int(ano_maq)) + 1
+                anos_uso = max(1, anos_uso)
+            else:
+                # Novo ou ano inválido/futuro => considera como ano atual apenas
+                anos_uso = 1
+            anos_uso_list.append(anos_uso)
+        df["anos_uso"] = anos_uso_list
+    else:
+        # Considerar todas as máquinas como novas => anos_uso = 1 sempre
         df["anos_uso"] = 1
 
     df_sorted = df.sort_values(by="Chassi").reset_index(drop=True)
@@ -318,10 +340,10 @@ def _quantidade_para_maquina_especifica(row, ha_ano_maquina, n_linhas_maquina, a
     usando os parâmetros dessa máquina (hectares/ano e nº de linhas) e,
     opcionalmente, considerando anos anteriores.
 
-    - Para "Considerar ano atual": usa apenas ha_ano_maquina (lógica original).
-    - Para "Considerar anos anteriores" + modo Inteiro:
+    - Para "Considerar todas as máquinas como novas": usa apenas ha_ano_maquina (anos_uso = 1).
+    - Para "Considerar com base no ano e estado" + modo Inteiro:
         conta somente os ciclos que "rompem" dentro do ano atual.
-    - Para "Considerar anos anteriores" + modo Proporcional:
+    - Para "Considerar com base no ano e estado" + modo Proporcional:
         conta (ciclos completos dentro do ano) + fração do ciclo em andamento
         ao final do ano atual (ex.: 3 trocas + fração proporcional ao restante).
     """
@@ -353,9 +375,9 @@ def _quantidade_para_maquina_especifica(row, ha_ano_maquina, n_linhas_maquina, a
         return 0.0
 
     modo_qtd = _modo_qtd_para_codigo(row)
-    considerar_anos_flag = st.session_state.get("considerar_anos", "Considerar ano atual")
+    considerar_anos_flag = st.session_state.get("considerar_anos", "Considerar todas as máquinas como novas")
 
-    if considerar_anos_flag in ["Considerar anos anteriores", "Considerar anos anteriores e futuros"] and anos_uso >= 1:
+    if considerar_anos_flag == "Considerar com base no ano e estado" and anos_uso >= 1:
         # Hectares acumulados até o início e até o fim do ano atual
         start_prev = (anos_uso - 1) * ha_ano
         end_current = anos_uso * ha_ano
@@ -680,11 +702,12 @@ def calcular_hect_ref_e_qtd_prevista(
       - Hectare referência (vida_total): se Proporção='Linha' => hectare_efetivo * n_linhas; senão, por máquina.
       - Quantidade prevista: usa ha_ano do chassi selecionado, vida_total e Qtd/Proporção,
         aplicando a proporção de troca informada no input atual.
+      - Quantidade de ciclos: número de ciclos de vida completos (modo Inteiro) ou fracionados (modo Proporcional).
 
     Se modo_qtd_atual for informado (página 2), usa esse modo.
     Se não, busca modo em ajustes_pecas/global via _modo_qtd_para_codigo.
 
-    Quando "Considerar anos anteriores" está ativo, utiliza também anos_uso_maquina
+    Quando "Considerar com base no ano e estado" está ativo, utiliza também anos_uso_maquina
     para separar o que aconteceu antes e dentro do ano atual, tanto no modo Inteiro
     quanto no Proporcional (ex.: 3 trocas + parte proporcional ao restante).
     """
@@ -697,9 +720,9 @@ def calcular_hect_ref_e_qtd_prevista(
         prop_troca = float(proporcao_troca_atual)
         anos_uso_ref = int(resumo_maquina_ref.get("anos_uso_maquina", 1) or 1)
     except Exception:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
 
-    considerar_anos_flag = st.session_state.get("considerar_anos", "Considerar ano atual")
+    considerar_anos_flag = st.session_state.get("considerar_anos", "Considerar todas as máquinas como novas")
 
     if tipo_prop == "linha":
         vida_total = vida_base * n_linhas
@@ -708,13 +731,16 @@ def calcular_hect_ref_e_qtd_prevista(
         vida_total = vida_base
         qtd_total_por_ciclo = qtd_por_prop
 
+    qtd_prevista = 0.0
+    ciclos = 0.0
+
     if vida_total > 0:
         if modo_qtd_atual is not None:
             modo_qtd = modo_qtd_atual
         else:
             modo_qtd = _modo_qtd_para_codigo(row)
 
-        if considerar_anos_flag in ["Considerar anos anteriores", "Considerar anos anteriores e futuros"] and anos_uso_ref >= 1:
+        if considerar_anos_flag == "Considerar com base no ano e estado" and anos_uso_ref >= 1:
             # Mesma lógica usada em _quantidade_para_maquina_especifica
             start_prev = (anos_uso_ref - 1) * ha_ano
             end_current = anos_uso_ref * ha_ano
@@ -736,10 +762,8 @@ def calcular_hect_ref_e_qtd_prevista(
 
         consumo_teorico = ciclos * qtd_total_por_ciclo
         qtd_prevista = consumo_teorico * (prop_troca / 100.0)
-    else:
-        qtd_prevista = 0.0
 
-    return float(vida_total), float(qtd_prevista)
+    return float(vida_total), float(qtd_prevista), float(ciclos)
 
 
 # ------------------------------------------------------------
@@ -923,7 +947,7 @@ def run_processamento_if_needed(show_msg=False):
     """
     Reprocessa máquinas e peças quando a assinatura mudar.
     Inclui modo_calculo_qtd e considerar_anos, então mudar Proporcional/Inteiro
-    na página 1 ou alternar entre 'ano atual' e 'anos anteriores'
+    na página 1 ou alternar entre cenários de horizonte
     força reprocessamento.
     Também reseta os rádios de modo das peças que NÃO são manuais.
     """
@@ -1083,7 +1107,7 @@ if pagina == "1. Entrada de Dados":
         st.info(f"Modo atual: {st.session_state['modo_operacao']}")
 
     with st.expander("Parâmetros avançados (opcional)"):
-    
+
         st.session_state["modo_operacao"] = st.selectbox(
             "Modo de operação",
             ["Leve", "Moderado", "Extremo"],
@@ -1141,21 +1165,25 @@ if pagina == "1. Entrada de Dados":
         )
     )
 
-    # NOVO: horizonte de cálculo (anos anteriores x ano atual x anos anteriores e futuros)
+    # NOVO: horizonte de cálculo (anos anteriores x ano atual x baseado em estado)
     st.markdown("---")
     st.subheader("Horizonte de cálculo (vida útil das máquinas)")
     opcoes_horizonte = [
-        "Considerar ano atual",
-        "Considerar anos anteriores",
-        "Considerar anos anteriores e futuros"
+        "Considerar todas as máquinas como novas",
+        "Considerar com base no ano e estado"
     ]
-    valor_atual_horizonte = st.session_state.get("considerar_anos", "Considerar ano atual")
+    valor_atual_horizonte = st.session_state.get("considerar_anos", "Considerar todas as máquinas como novas")
     idx_horizonte = opcoes_horizonte.index(valor_atual_horizonte) if valor_atual_horizonte in opcoes_horizonte else 0
     st.session_state["considerar_anos"] = st.radio(
-        "Como considerar o ano das máquinas?",
+        "Como considerar a vida útil das máquinas?",
         opcoes_horizonte,
         horizontal=True,
         index=idx_horizonte
+    )
+
+    st.caption(
+        "- **Considerar todas as máquinas como novas**: ignora histórico de uso e considera 1 ano de operação para todas.\n"
+        "- **Considerar com base no ano e estado**: usa o ano da máquina e o estado (Usado/Novo) para calcular o número de anos de uso."
     )
 
     # NOVO: modo de cálculo da quantidade
@@ -1427,8 +1455,8 @@ elif pagina == "2. Ajustes de Peças":
                 synced_hect = float(st.session_state[key_hect])
                 synced_ref = float(st.session_state[key_ref])
 
-                # Calcula vida_total (Hectare referência) e quantidade prevista
-                vida_total, qtd_prevista = calcular_hect_ref_e_qtd_prevista(
+                # Calcula vida_total (Hectare referência), quantidade prevista e quantidade de ciclos
+                vida_total, qtd_prevista, qtd_ciclos = calcular_hect_ref_e_qtd_prevista(
                     row,
                     resumo_ref,
                     synced_hect,
@@ -1436,6 +1464,12 @@ elif pagina == "2. Ajustes de Peças":
                     modo_qtd_atual=modo_escolhido
                 )
                 st.write(f"**Quantidade prevista**: {int(round(qtd_prevista))}")
+
+                # Exibe a quantidade de ciclos necessária
+                if modo_escolhido == "Inteiro":
+                    st.write(f"**Quantidade de ciclos:** {int(np.floor(qtd_ciclos))}")
+                else:
+                    st.write(f"**Quantidade de ciclos:** {qtd_ciclos:.2f}")
 
             with cC:
                 st.write(f"Proporção declarada: {row['Proporção']}")
@@ -1773,24 +1807,6 @@ elif pagina == "4. Análise operacional":
             # Frota inteira -> todos os chassis do modelo já filtrados em df_maquinas_proc
             df_maqs_local = df_maqs_all.copy()
 
-        # NOVO: tratamento especial para máquinas futuras na página 4
-        considerar_anos_flag = st.session_state.get("considerar_anos", "Considerar ano atual")
-        current_year = datetime.date.today().year
-        if considerar_anos_flag == "Considerar anos anteriores e futuros" and "Ano" in df_maqs_local.columns:
-            df_maqs_local["Ano"] = pd.to_numeric(df_maqs_local["Ano"], errors="coerce")
-            if isinstance(inicio_operacao, datetime.date):
-                ano_inicio_operacao = inicio_operacao.year
-                # Máquinas com Ano <= ano_atual: mantidas
-                mask_anteriores_ou_atual = df_maqs_local["Ano"].isna() | (df_maqs_local["Ano"] <= current_year)
-                # Máquinas futuras (Ano > ano_atual): só se Ano == ano_inicio_operacao
-                mask_futuras_validas = (df_maqs_local["Ano"] > current_year) & (df_maqs_local["Ano"] == ano_inicio_operacao)
-                df_maqs_local = df_maqs_local[mask_anteriores_ou_atual | mask_futuras_validas]
-            else:
-                # Se não houver início de operação válido, não considera máquinas futuras
-                df_maqs_local = df_maqs_local[
-                    df_maqs_local["Ano"].isna() | (df_maqs_local["Ano"] <= current_year)
-                ]
-
         if df_maqs_local.empty:
             st.warning("Não há chassis disponíveis para o escopo selecionado.")
         else:
@@ -1851,7 +1867,7 @@ elif pagina == "4. Análise operacional":
             else:
                 linhas_calendario = []
 
-                considerar_anos_flag = st.session_state.get("considerar_anos", "Considerar ano atual")
+                considerar_anos_flag = st.session_state.get("considerar_anos", "Considerar todas as máquinas como novas")
 
                 # ---------- Geração de eventos por máquina + peça ----------
                 for _, m in df_maqs_local.iterrows():
@@ -1868,7 +1884,7 @@ elif pagina == "4. Análise operacional":
                         continue
 
                     # Hectares acumulados antes do ano atual e dentro do ano atual
-                    if considerar_anos_flag in ["Considerar anos anteriores", "Considerar anos anteriores e futuros"] and anos_uso_maq > 1:
+                    if considerar_anos_flag == "Considerar com base no ano e estado" and anos_uso_maq > 1:
                         start_prev_ha = (anos_uso_maq - 1) * ha_ano_maq
                     else:
                         start_prev_ha = 0.0
