@@ -6,9 +6,10 @@ import datetime
 import altair as alt
 
 st.set_page_config(
-    page_title="Manutenção / Consumo de Peças",
+    page_title="FleetCycle",
     layout="wide"
 )
+
 
 # ------------------------------------------------------------
 # Funções auxiliares de formatação/normalização
@@ -998,9 +999,22 @@ def run_processamento_if_needed(show_msg=False):
 # ------------------------------------------------------------
 
 init_session_state()
+
+# --- Logo na barra lateral (oculta junto com a barra) ---
+st.sidebar.image(
+    "https://i.postimg.cc/sgJ9PrBJ/Chat-GPT-Image-1-de-dez-de-2025-17-02-38.png",
+    use_container_width=True
+)
+
+# --- Navegação da sidebar ---
 pagina = st.sidebar.radio(
     "Navegação",
-    ["1. Entrada de Dados", "2. Ajustes de Peças", "3. Resumo / Resultados", "4. Análise operacional"]
+    [
+        "1. Entrada de Dados",
+        "2. Ajustes de Peças",
+        "3. Resumo / Resultados",
+        "4. Análise operacional"
+    ]
 )
 
 # ------------------------------------------------------------
@@ -2136,7 +2150,7 @@ elif pagina == "4. Análise operacional":
 
                         chart = (
                             alt.Chart(chart_data)
-                            .mark_bar()
+                            .mark_bar(color="#A70623")
                             .encode(
                                 x=alt.X(
                                     "DataLabel:N",
