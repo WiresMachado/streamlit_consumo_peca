@@ -6,7 +6,7 @@ import datetime
 import altair as alt
 
 st.set_page_config(
-    page_title="FleetCycle",
+    page_title="Calculate Parts",
     layout="wide"
 )
 
@@ -70,6 +70,18 @@ def init_session_state():
         # - "Considerar todas as máquinas como novas"
         # - "Considerar com base no ano e estado"
         "considerar_anos": "Considerar todas as máquinas como novas",
+
+        # ---------------------------
+        # Página 5 - Plano de Manutenção
+        # ---------------------------
+        "plano_chassi_selecionado": None,   # chassi escolhido só para o plano (independente da pág 1)
+        "plano_tempo_operacao_anos": 1,     # inteiro
+
+        "filtro_familia_p5": "Todos",
+        "filtro_campo_p5": "Todos",
+        "filtro_valor_p5": "",
+
+        "metrica_graf_p5": "Custo total (R$)",  # ou "Custo por hectare (R$/ha)"
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -406,6 +418,64 @@ def _quantidade_para_maquina_especifica(row, ha_ano_maquina, n_linhas_maquina, a
     return float(qtd_rec)
 
 
+# -------- helper NOVO: página 5 (sempre máquina nova e simulação Ano 1..N) --------
+
+def _quantidade_para_maquina_especifica_plano(row, ha_ano_maquina, n_linhas_maquina, ano_ciclo):
+    """
+    Página 5: sempre considera a máquina como NOVA no Ano 1 e simula Ano 1..N.
+    Usa a mesma lógica de separação por anos (start_prev/end_current),
+    mas sem depender do st.session_state['considerar_anos'].
+
+    - ano_ciclo = 1 => primeiro ano (novo)
+    - ano_ciclo = 2 => segundo ano, etc.
+    """
+    try:
+        vida_base = float(row["hectare_proporcao_efetivo"])
+        qtd_por_prop = float(row["Qtd/Proporção"])
+        prop_troca = float(row["proporcao_troca_%"])
+        tipo_prop = str(row["Proporção"]).strip().lower()
+    except Exception:
+        return 0.0
+
+    if vida_base <= 0:
+        return 0.0
+
+    ha_ano = float(ha_ano_maquina or 0.0)
+    n_linhas = int(n_linhas_maquina or 1)
+
+    if ha_ano <= 0:
+        return 0.0
+
+    if tipo_prop == "linha":
+        vida_total = vida_base * n_linhas
+        qtd_total_por_ciclo = qtd_por_prop * n_linhas
+    else:
+        vida_total = vida_base
+        qtd_total_por_ciclo = qtd_por_prop
+
+    if vida_total <= 0:
+        return 0.0
+
+    modo_qtd = _modo_qtd_para_codigo(row)
+
+    anos_uso = int(max(1, ano_ciclo))
+    start_prev = (anos_uso - 1) * ha_ano
+    end_current = anos_uso * ha_ano
+
+    if modo_qtd == "Inteiro":
+        ciclos_ini = np.floor(start_prev / vida_total)
+        ciclos_fim = np.floor(end_current / vida_total)
+        ciclos = max(0.0, ciclos_fim - ciclos_ini)
+    else:
+        x0 = start_prev / vida_total
+        x1 = end_current / vida_total
+        ciclos = max(0.0, x1 - np.floor(x0))
+
+    consumo_teorico = ciclos * qtd_total_por_ciclo
+    qtd_rec = consumo_teorico * (prop_troca / 100.0)
+    return float(qtd_rec)
+
+
 def _quantidade_recomendada_uma_maquina(row, resumo_maquina_ref):
     """
     Usa a máquina de referência (resumo_maquina_ref) para calcular
@@ -615,6 +685,14 @@ def gerar_planilha_exportacao(df_pecas_proc, resumo_maquina_ref, familia_filter=
 
 
 def calcular_indicadores_resumo(df_pecas_proc, resumo_maquina_ref, escopo="Apenas chassi selecionado"):
+    """
+    MELHORIA (item 2):
+    - Quando escopo = Frota inteira:
+        custo médio por hectare = (Custo total sugerido frota) / (soma de ha_ano_chassi da frota)
+        custo médio por hora    = (Custo total sugerido frota) / (soma de horas_chassi_ano da frota)
+    - Quando escopo = Apenas chassi selecionado:
+        mantém base na máquina de referência (como estava).
+    """
     if df_pecas_proc is None or df_pecas_proc.empty:
         return {
             "custo_total_estoque": 0.0,
@@ -630,13 +708,25 @@ def calcular_indicadores_resumo(df_pecas_proc, resumo_maquina_ref, escopo="Apena
     )
     custo_total_escopo = df_agr["Custo total"].sum() if not df_agr.empty else 0.0
 
-    ha_ano = resumo_maquina_ref.get("ha_ano_maquina", 0.0)
-    horas_ano = resumo_maquina_ref.get("horas_maquina_ano", 0.0)
+    if escopo == "Frota inteira":
+        df_maqs = st.session_state.get("df_maquinas_proc")
+        if df_maqs is not None and not df_maqs.empty:
+            total_ha_ano = pd.to_numeric(df_maqs.get("ha_ano_chassi", 0.0), errors="coerce").fillna(0.0).sum()
+            total_horas_ano = pd.to_numeric(df_maqs.get("horas_chassi_ano", 0.0), errors="coerce").fillna(0.0).sum()
+        else:
+            total_ha_ano = 0.0
+            total_horas_ano = 0.0
 
-    custo_por_maquina_ref = df_pecas_proc["custo_planejado_item"].sum()
+        custo_medio_por_hectare = (custo_total_escopo / total_ha_ano) if total_ha_ano else np.nan
+        custo_medio_por_hora = (custo_total_escopo / total_horas_ano) if total_horas_ano else np.nan
+    else:
+        ha_ano = float(resumo_maquina_ref.get("ha_ano_maquina", 0.0) or 0.0)
+        horas_ano = float(resumo_maquina_ref.get("horas_maquina_ano", 0.0) or 0.0)
 
-    custo_medio_por_hectare = (custo_por_maquina_ref / ha_ano) if ha_ano else np.nan
-    custo_medio_por_hora = (custo_por_maquina_ref / horas_ano) if horas_ano else np.nan
+        custo_por_maquina_ref = df_pecas_proc["custo_planejado_item"].sum()
+
+        custo_medio_por_hectare = (custo_por_maquina_ref / ha_ano) if ha_ano else np.nan
+        custo_medio_por_hora = (custo_por_maquina_ref / horas_ano) if horas_ano else np.nan
 
     return {
         "custo_total_estoque": float(custo_total_escopo),
@@ -1002,7 +1092,7 @@ init_session_state()
 
 # --- Logo na barra lateral (oculta junto com a barra) ---
 st.sidebar.image(
-    "https://i.postimg.cc/sgJ9PrBJ/Chat-GPT-Image-1-de-dez-de-2025-17-02-38.png",
+    "https://i.postimg.cc/Kz9xcnJr/Chat-GPT-Image-6-de-fev-de-2026-15-14-23.png",
     use_container_width=True
 )
 
@@ -1013,7 +1103,8 @@ pagina = st.sidebar.radio(
         "1. Entrada de Dados",
         "2. Ajustes de Peças",
         "3. Resumo / Resultados",
-        "4. Análise operacional"
+        "4. Análise operacional",
+        "5. Plano de Manutenção"
     ]
 )
 
@@ -1592,7 +1683,7 @@ elif pagina == "3. Resumo / Resultados":
                 else "n/d"
             )
             st.metric("Custo médio por hectare (R$/ha)", value=val_hect)
-            st.caption("Base: máquina de referência (por máquina).")
+            st.caption("Base: escopo selecionado.")
         with col_r3:
             val_hora = (
                 format_currency(indicadores['custo_medio_por_hora'])
@@ -1600,7 +1691,7 @@ elif pagina == "3. Resumo / Resultados":
                 else "n/d"
             )
             st.metric("Custo médio por hora (R$/h)", value=val_hora)
-            st.caption("Base: máquina de referência (por máquina).")
+            st.caption("Base: escopo selecionado.")
 
         st.markdown("---")
 
@@ -1626,6 +1717,12 @@ elif pagina == "3. Resumo / Resultados":
             familia_filter=st.session_state["filtro_familia_resumo"],
             escopo=st.session_state["escopo_resumo"]
         ).copy()
+
+        # MELHORIA (item 1): não mostrar itens com Qtd recomendada == 0
+        if not df_export_preview_num.empty:
+            df_export_preview_num = df_export_preview_num[
+                pd.to_numeric(df_export_preview_num["Qtd recomendada"], errors="coerce").fillna(0.0) > 0
+            ].copy()
 
         if not df_export_preview_num.empty:
             cols_busca = df_export_preview_num.columns.tolist()
@@ -2139,34 +2236,351 @@ elif pagina == "4. Análise operacional":
                             y_col = "Custo"
                             y_title = "Custo (R$)"
 
-                        chart_data = df_cal.copy()
-                        # Colunas formatadas para tooltip
-                        chart_data["Quantidade_str"] = chart_data["Quantidade peça"].apply(
-                            lambda x: f"{int(round(x))}"
+                        # --- GARANTIA: Data troca existe e é datetime ---
+                        if "Data troca" not in df_cal.columns:
+                            st.error("A coluna 'Data troca' não foi encontrada para gerar o gráfico.")
+                        else:
+                            # garante datetime (se por algum motivo não estiver)
+                            if not np.issubdtype(df_cal["Data troca"].dtype, np.datetime64):
+                                df_cal["Data troca"] = pd.to_datetime(df_cal["Data troca"], errors="coerce")
+
+                            df_chart_base = df_cal.dropna(subset=["Data troca"]).copy()
+
+                            if df_chart_base.empty:
+                                st.info("Sem dados válidos de 'Data troca' para montar o gráfico (após filtros).")
+                            else:
+                                # ✅ forma mais robusta: resample mensal
+                                chart_month = (
+                                    df_chart_base
+                                    .set_index("Data troca")[["Quantidade peça", "Custo"]]
+                                    .resample("MS")
+                                    .sum()
+                                    .reset_index()
+                                )
+
+                                if chart_month.empty:
+                                    st.info("Nenhum dado mensal disponível para o gráfico com os filtros atuais.")
+                                else:
+                                    chart_month["DataLabel"] = chart_month["Data troca"].dt.strftime("%m/%Y")
+                                    chart_month["Quantidade_str"] = (
+                                        pd.to_numeric(chart_month["Quantidade peça"], errors="coerce")
+                                        .fillna(0)
+                                        .round(0)
+                                        .astype(int)
+                                        .astype(str)
+                                    )
+                                    chart_month["Custo_str"] = (
+                                        pd.to_numeric(chart_month["Custo"], errors="coerce")
+                                        .fillna(0.0)
+                                        .apply(format_currency)
+                                    )
+
+                                    chart = (
+                                        alt.Chart(chart_month)
+                                        .mark_bar(color="#A70623")
+                                        .encode(
+                                            x=alt.X(
+                                                "DataLabel:N",
+                                                title="Mês/Ano",
+                                                sort=alt.SortField(field="Data troca", order="ascending")
+                                            ),
+                                            y=alt.Y(f"{y_col}:Q", title=y_title),
+                                            tooltip=[
+                                                alt.Tooltip("DataLabel:N", title="Mês/Ano"),
+                                                alt.Tooltip("Quantidade_str:N", title="Quantidade"),
+                                                alt.Tooltip("Custo_str:N", title="Custo"),
+                                            ]
+                                        )
+                                        .interactive()
+                                    )
+
+                                    st.altair_chart(chart, use_container_width=True)
+                else:
+                    st.info("Nenhum evento de troca foi gerado com os parâmetros atuais.")
+
+
+# ------------------------------------------------------------
+# PÁGINA 5 - Plano de Manutenção
+# ------------------------------------------------------------
+elif pagina == "5. Plano de Manutenção":
+    st.title("5. Plano de Manutenção")
+
+    run_processamento_if_needed(show_msg=False)
+
+    # pré-requisitos mínimos
+    if (
+        st.session_state["df_pecas_proc"] is None
+        or st.session_state["df_maquinas_proc"] is None
+        or st.session_state["df_pecas_proc"].empty
+        or st.session_state["df_maquinas_proc"].empty
+    ):
+        st.warning("Você ainda não carregou dados ou não processou na página 1. Volte para '1. Entrada de Dados'.")
+    else:
+        df_maqs = st.session_state["df_maquinas_proc"].copy()
+        df_maqs["Chassi"] = df_maqs["Chassi"].astype(str)
+
+        # ---------- seleção independente de chassi ----------
+        chassis_opcoes_p5 = (
+            df_maqs["Chassi"].astype(str).sort_values().unique().tolist()
+            if "Chassi" in df_maqs.columns else []
+        )
+        if not chassis_opcoes_p5:
+            st.warning("Não há chassis disponíveis para o modelo processado.")
+        else:
+            # mantém valor salvo
+            if st.session_state.get("plano_chassi_selecionado") not in chassis_opcoes_p5:
+                st.session_state["plano_chassi_selecionado"] = chassis_opcoes_p5[0]
+
+            st.session_state["plano_chassi_selecionado"] = st.selectbox(
+                "Selecione o chassi para o Plano de Manutenção (independente da página 1)",
+                chassis_opcoes_p5,
+                index=chassis_opcoes_p5.index(st.session_state["plano_chassi_selecionado"])
+            )
+
+            chassi_p5 = str(st.session_state["plano_chassi_selecionado"])
+
+            # ---------- tabela de info do chassi ----------
+            row_maq = df_maqs[df_maqs["Chassi"] == chassi_p5]
+            if row_maq.empty:
+                st.warning("Chassi não encontrado no processamento atual.")
+            else:
+                row_maq = row_maq.iloc[0]
+
+                # pega infos do raw (para mostrar Ano exatamente como importado), mas usa proc se faltar
+                df_raw = st.session_state.get("df_maquinas_raw")
+                if df_raw is not None and not df_raw.empty and "Chassi" in df_raw.columns:
+                    tmp_raw = df_raw.copy()
+                    tmp_raw["Chassi"] = tmp_raw["Chassi"].astype(str)
+                    row_raw = tmp_raw[tmp_raw["Chassi"].astype(str) == chassi_p5]
+                    row_raw = row_raw.iloc[0] if not row_raw.empty else None
+                else:
+                    row_raw = None
+
+                modelo_show = (row_raw.get("Modelo") if row_raw is not None else row_maq.get("Modelo"))
+                linhas_show = (row_raw.get("Linhas") if row_raw is not None else row_maq.get("Linhas"))
+                esp_show = (row_raw.get("Espaçamento") if row_raw is not None else row_maq.get("Espaçamento"))
+                ano_bruto = (row_raw.get("Ano") if row_raw is not None else row_maq.get("Ano"))
+                ano_show = format_ano(ano_bruto)  # <- garante string "2026"
+
+                df_info = pd.DataFrame([{
+                    "Modelo": modelo_show,
+                    "Linhas": linhas_show,
+                    "Espaçamento": esp_show,
+                    "Ano": ano_show
+                }])
+
+                st.subheader("Informações do chassi selecionado")
+                st.dataframe(df_info, use_container_width=True, hide_index=True)
+
+                # ---------- tempo de operação ----------
+                st.markdown("---")
+                st.session_state["plano_tempo_operacao_anos"] = st.number_input(
+                    "Tempo de operação (anos)",
+                    min_value=1,
+                    step=1,
+                    value=int(st.session_state.get("plano_tempo_operacao_anos", 1)),
+                    help="Número inteiro de anos (ciclos) para simular: Ano 1, Ano 2, ...",
+                )
+                tempo_anos = int(st.session_state["plano_tempo_operacao_anos"])
+
+                # parâmetros dessa máquina (hectares/ano e linhas) — sempre considera NOVA no Ano 1 aqui
+                ha_ano_maq = float(row_maq.get("ha_ano_chassi", 0.0) or 0.0)
+                n_linhas_maq = int(row_maq.get("Linhas", 1) or 1)
+
+                if ha_ano_maq <= 0:
+                    st.warning("Hectare/ano dessa máquina ficou 0. Verifique os parâmetros da página 1.")
+                else:
+                    # ---------- gera tabela Ano 1..N ----------
+                    df_pecas_base = st.session_state["df_pecas_proc"].copy()
+
+                    # trabalha por Código único (como nas outras telas)
+                    df_unique_p = df_pecas_base.groupby("Código").first().reset_index()
+                    df_unique_p["Código"] = df_unique_p["Código"].apply(format_codigo)
+
+                    linhas_out = []
+                    for ano_ciclo in range(1, tempo_anos + 1):
+                        ano_label = f"Ano {ano_ciclo}"
+                        for _, p in df_unique_p.iterrows():
+                            qtd = _quantidade_para_maquina_especifica_plano(
+                                p,
+                                ha_ano_maq,
+                                n_linhas_maq,
+                                ano_ciclo
+                            )
+                            if qtd <= 0:
+                                continue
+
+                            custo_unit = float(p.get("custo_unitario", 0.0) or 0.0)
+                            custo_total = float(qtd) * custo_unit
+
+                            linhas_out.append({
+                                "Ano": ano_label,
+                                "Família": p.get("Família", ""),
+                                "Código": format_codigo(p.get("Código", "")),
+                                "Descrição": p.get("Descrição", ""),
+                                "Qtd recomendada": float(qtd),
+                                "Custo total (R$)": float(custo_total),
+                            })
+
+                    df_plano = pd.DataFrame(linhas_out)
+
+                    st.markdown("---")
+                    st.subheader("Plano de Manutenção (por ano/ciclo)")
+
+                    if df_plano.empty:
+                        st.info("Nenhum item com quantidade recomendada > 0 para o chassi e período selecionados.")
+                    else:
+                        # arredonda qtd para visualização
+                        df_plano["Qtd recomendada"] = (
+                            pd.to_numeric(df_plano["Qtd recomendada"], errors="coerce")
+                            .fillna(0.0)
+                            .round(0)
                         )
-                        chart_data["Custo_str"] = chart_data["Custo"].apply(format_currency)
-                        # rótulo categórico mm/aaaa para usar apenas datas que têm informação
-                        chart_data["DataLabel"] = chart_data["Data troca"].dt.strftime("%m/%Y")
+
+                        # ---------- filtros (igual estilo pág 4) ----------
+                        familias_p5 = sorted(df_plano["Família"].dropna().unique().tolist())
+                        familias_dropdown_p5 = ["Todos"] + familias_p5
+
+                        col_f1, col_f2, col_f3 = st.columns([1.2, 1.2, 2])
+                        with col_f1:
+                            st.session_state["filtro_familia_p5"] = st.selectbox(
+                                "Família",
+                                familias_dropdown_p5,
+                                index=(
+                                    familias_dropdown_p5.index(st.session_state["filtro_familia_p5"])
+                                    if st.session_state["filtro_familia_p5"] in familias_dropdown_p5
+                                    else 0
+                                )
+                            )
+                        with col_f2:
+                            st.session_state["filtro_campo_p5"] = st.selectbox(
+                                "Filtrar por campo",
+                                ["Todos", "Ano", "Código", "Descrição", "Família"],
+                                index=(
+                                    ["Todos", "Ano", "Código", "Descrição", "Família"].index(st.session_state["filtro_campo_p5"])
+                                    if st.session_state["filtro_campo_p5"] in ["Todos", "Ano", "Código", "Descrição", "Família"]
+                                    else 0
+                                )
+                            )
+                        with col_f3:
+                            st.session_state["filtro_valor_p5"] = st.text_input(
+                                "Valor do filtro (contém)",
+                                value=st.session_state["filtro_valor_p5"]
+                            )
+
+                        # aplica filtro de família
+                        fam_sel = st.session_state["filtro_familia_p5"]
+                        if fam_sel != "Todos":
+                            df_plano = df_plano[df_plano["Família"] == fam_sel]
+
+                        # aplica filtro de texto
+                        filtro_txt = st.session_state["filtro_valor_p5"].strip().lower()
+                        campo = st.session_state["filtro_campo_p5"]
+
+                        if filtro_txt:
+                            if campo == "Todos":
+                                mask = (
+                                    df_plano["Ano"].astype(str).str.lower().str.contains(filtro_txt)
+                                    | df_plano["Código"].astype(str).str.lower().str.contains(filtro_txt)
+                                    | df_plano["Descrição"].astype(str).str.lower().str.contains(filtro_txt)
+                                    | df_plano["Família"].astype(str).str.lower().str.contains(filtro_txt)
+                                )
+                            elif campo == "Ano":
+                                mask = df_plano["Ano"].astype(str).str.lower().str.contains(filtro_txt)
+                            elif campo == "Código":
+                                mask = df_plano["Código"].astype(str).str.lower().str.contains(filtro_txt)
+                            elif campo == "Descrição":
+                                mask = df_plano["Descrição"].astype(str).str.lower().str.contains(filtro_txt)
+                            else:
+                                mask = df_plano["Família"].astype(str).str.lower().str.contains(filtro_txt)
+                            df_plano = df_plano[mask]
+
+                        # ---------- tabela final ----------
+                        st.dataframe(
+                            df_plano,
+                            column_config={
+                                "Ano": st.column_config.TextColumn("Ano"),
+                                "Família": st.column_config.TextColumn("Família"),
+                                "Código": st.column_config.TextColumn("Código"),
+                                "Descrição": st.column_config.TextColumn("Descrição"),
+                                "Qtd recomendada": st.column_config.NumberColumn("Qtd recomendada", format="%.0f"),
+                                "Custo total (R$)": st.column_config.NumberColumn("Custo total (R$)", format="R$ %.2f"),
+                            },
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+
+                        # ---------- export excel ----------
+                        buffer_p5 = BytesIO()
+                        with pd.ExcelWriter(buffer_p5, engine="xlsxwriter") as writer:
+                            df_plano.to_excel(writer, index=False, sheet_name="Plano_manutencao")
+                        buffer_p5.seek(0)
+
+                        st.download_button(
+                            label="Exportar Plano de Manutenção (Excel)",
+                            data=buffer_p5,
+                            file_name="plano_manutencao.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True
+                        )
+
+                        # ---------- gráfico ----------
+                        st.markdown("---")
+                        st.subheader("Gráfico por ano/ciclo")
+
+                        metrica = st.radio(
+                            "Métrica do gráfico",
+                            ["Custo total (R$)", "Custo por hectare (R$/ha)"],
+                            horizontal=True,
+                            index=(0 if st.session_state.get("metrica_graf_p5", "Custo total (R$)") == "Custo total (R$)" else 1),
+                        )
+                        st.session_state["metrica_graf_p5"] = metrica
+
+                        # agrega por ano
+                        df_g = (
+                            df_plano
+                            .groupby("Ano", as_index=False)
+                            .agg({
+                                "Custo total (R$)": "sum"
+                            })
+                        )
+
+                        # custo por hectare usando ha_ano_maq (já calculado antes)
+                        df_g["Custo por hectare (R$/ha)"] = df_g["Custo total (R$)"] / float(ha_ano_maq)
+
+                        if metrica == "Custo total (R$)":
+                            y_col = "Custo total (R$)"
+                            y_title = "Custo total (R$)"
+                        else:
+                            y_col = "Custo por hectare (R$/ha)"
+                            y_title = "Custo por hectare (R$/ha)"
+
+                        # ordena Ano 1..N corretamente
+                        def _ano_num(x):
+                            try:
+                                return int(str(x).lower().replace("ano", "").strip())
+                            except:
+                                return 999999
+
+                        df_g["Ano_num"] = df_g["Ano"].apply(_ano_num)
+                        df_g = df_g.sort_values("Ano_num").reset_index(drop=True)
+
+                        df_g["CustoTotal_str"] = df_g["Custo total (R$)"].apply(format_currency)
+                        df_g["CustoHa_str"] = df_g["Custo por hectare (R$/ha)"].apply(format_currency)
 
                         chart = (
-                            alt.Chart(chart_data)
+                            alt.Chart(df_g)
                             .mark_bar(color="#A70623")
                             .encode(
-                                x=alt.X(
-                                    "DataLabel:N",
-                                    title="Mês/Ano",
-                                    sort=alt.SortField(field="Data troca", order="ascending")
-                                ),
+                                x=alt.X("Ano:N", title="Ano do ciclo", sort=alt.SortField(field="Ano_num", order="ascending")),
                                 y=alt.Y(f"{y_col}:Q", title=y_title),
                                 tooltip=[
-                                    alt.Tooltip("DataLabel:N", title="Mês/Ano"),
-                                    alt.Tooltip("Quantidade_str:N", title="Quantidade"),
-                                    alt.Tooltip("Custo_str:N", title="Custo"),
+                                    alt.Tooltip("Ano:N", title="Ano"),
+                                    alt.Tooltip("CustoTotal_str:N", title="Custo total"),
+                                    alt.Tooltip("CustoHa_str:N", title="Custo por hectare"),
                                 ]
                             )
                             .interactive()
                         )
 
                         st.altair_chart(chart, use_container_width=True)
-                else:
-                    st.info("Nenhum evento de troca foi gerado com os parâmetros atuais.")
