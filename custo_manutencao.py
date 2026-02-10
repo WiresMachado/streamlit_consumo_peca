@@ -2189,11 +2189,15 @@ elif pagina == "5. Plano de Manutenção":
                 tempo_anos = int(st.session_state["plano_tempo_operacao_anos"])
 
                 ha_ano_maq = float(row_maq.get("ha_ano_chassi", 0.0) or 0.0)
+                ha_hora_maq = float(row_maq.get("ha_hora_chassi", 0.0) or 0.0)
                 n_linhas_maq = int(row_maq.get("Linhas", 1) or 1)
 
                 if ha_ano_maq <= 0:
-                    st.warning("Hectare/ano dessa máquina ficou 0. Verifique os parâmetros da página 1.")
+                    st.warning("Hectare/ano desse chassi ficou 0. Verifique os parâmetros da página 1.")
                 else:
+                    # ----------------------------
+                    # Monta plano por ano/ciclo
+                    # ----------------------------
                     df_pecas_base = st.session_state["df_pecas_proc"].copy()
                     df_unique_p = df_pecas_base.groupby("Código").first().reset_index()
                     df_unique_p["Código"] = df_unique_p["Código"].apply(format_codigo)
@@ -2221,6 +2225,33 @@ elif pagina == "5. Plano de Manutenção":
                             })
 
                     df_plano = pd.DataFrame(linhas_out)
+
+                    # ----------------------------
+                    # ✅ Indicadores (similar ao Resumo/Resultados)
+                    # ----------------------------
+                    custo_total_periodo = float(df_plano["Custo total (R$)"].sum()) if not df_plano.empty else 0.0
+                    total_ha_periodo = float(ha_ano_maq) * float(tempo_anos)
+
+                    horas_ano = (float(ha_ano_maq) / float(ha_hora_maq)) if (ha_hora_maq and ha_hora_maq > 0) else 0.0
+                    total_horas_periodo = float(horas_ano) * float(tempo_anos)
+
+                    custo_medio_por_ha = (custo_total_periodo / total_ha_periodo) if total_ha_periodo > 0 else np.nan
+                    custo_medio_por_hora = (custo_total_periodo / total_horas_periodo) if total_horas_periodo > 0 else np.nan
+
+                    st.markdown("### Indicadores do Plano (período simulado)")
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        st.metric("Custo total sugerido (período)", value=format_currency(custo_total_periodo))
+                        st.caption(f"Base: {tempo_anos} ano(s) • chassi {chassi_p5}.")
+                    with c2:
+                        val_hect = format_currency(custo_medio_por_ha) if not np.isnan(custo_medio_por_ha) else "n/d"
+                        st.metric("Custo médio por hectare (R$/ha)", value=val_hect)
+                        st.caption(f"Base: ha/ano ({ha_ano_maq:.2f}) × {tempo_anos}.")
+                    with c3:
+                        val_hora = format_currency(custo_medio_por_hora) if not np.isnan(custo_medio_por_hora) else "n/d"
+                        st.metric("Custo médio por hora (R$/h)", value=val_hora)
+                        base_h = f"{horas_ano:.2f}" if horas_ano > 0 else "n/d"
+                        st.caption(f"Base: horas/ano ({base_h}) × {tempo_anos}.")
 
                     st.markdown("---")
                     st.subheader("Plano de Manutenção (por ano/ciclo)")
