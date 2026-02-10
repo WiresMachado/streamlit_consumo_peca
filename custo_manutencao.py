@@ -1567,7 +1567,7 @@ elif pagina == "3. Resumo / Resultados":
         )
 
         st.download_button(
-            label="Exportar Excel",
+            label="⬇️ Exportar",
             data=buffer_xlsx,
             file_name="planejamento_manutencao.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -1882,7 +1882,7 @@ elif pagina == "4. Análise operacional":
                         buffer_p4.seek(0)
 
                         st.download_button(
-                            label="Exportar tabela da análise operacional (Excel)",
+                            label="⬇️ Exportar",
                             data=buffer_p4,
                             file_name="analise_operacional.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -2206,7 +2206,7 @@ elif pagina == "5. Plano de Manutenção":
                         buffer_p5.seek(0)
 
                         st.download_button(
-                            label="⬇️ Exportar Plano de Manutenção (Excel .xlsx)",
+                            label="⬇️ Exportar",
                             data=buffer_p5,
                             file_name="plano_manutencao.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -2252,7 +2252,7 @@ elif pagina == "5. Plano de Manutenção":
                         buffer_graf_p5.seek(0)
 
                         st.download_button(
-                            label="⬇️ Exportar dados do gráfico (Excel .xlsx)",
+                            label="⬇️ Exportar",
                             data=buffer_graf_p5,
                             file_name="dados_grafico_plano_manutencao.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
