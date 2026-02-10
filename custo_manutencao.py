@@ -10,7 +10,6 @@ st.set_page_config(
     layout="wide"
 )
 
-
 # ------------------------------------------------------------
 # Funções auxiliares de formatação/normalização
 # ------------------------------------------------------------
@@ -63,9 +62,6 @@ def init_session_state():
         "ajustes_import_df": None,
         "ajustes_import_filename": None,
         "ajustes_import_applied": False,
-
-        # Modo global de cálculo da quantidade recomendada
-        "modo_calculo_qtd": "Proporcional",
 
         # Horizonte de cálculo (vida útil das máquinas)
         "considerar_anos": "Considerar todas as máquinas como novas",
@@ -306,37 +302,13 @@ def processar_maquinas(
     return df_sorted, resumo_ref
 
 
-# -------- helper: modo de cálculo por peça ou global --------
-
+# -------- helper: regra fixa do sistema --------
 def _modo_qtd_para_codigo(row_or_codigo):
-    """
-    Retorna o modo de cálculo da quantidade:
-      - se existir manual_modo=True e modo_qtd válido no ajustes_pecas => usa esse
-      - senão => usa o modo global da página 1
-    """
-    ajustes = st.session_state.get("ajustes_pecas", {})
-    try:
-        if isinstance(row_or_codigo, str):
-            cod = format_codigo(row_or_codigo)
-        else:
-            cod = format_codigo(row_or_codigo.get("Código"))
-    except Exception:
-        cod = None
-
-    modo_global = st.session_state.get("modo_calculo_qtd", "Proporcional")
-
-    if not cod or cod not in ajustes:
-        return modo_global
-
-    vals = ajustes[cod]
-    if vals.get("manual_modo", False) and vals.get("modo_qtd") in ["Proporcional", "Inteiro"]:
-        return vals["modo_qtd"]
-
-    return modo_global
+    # Regra fixa do sistema: sempre Inteiro (não expor no app)
+    return "Inteiro"
 
 
 # -------- helper: cálculo por máquina específica --------
-
 def _quantidade_para_maquina_especifica(row, ha_ano_maquina, n_linhas_maquina, anos_uso=1):
     try:
         vida_base = float(row["hectare_proporcao_efetivo"])
@@ -365,27 +337,18 @@ def _quantidade_para_maquina_especifica(row, ha_ano_maquina, n_linhas_maquina, a
     if vida_total <= 0:
         return 0.0
 
-    modo_qtd = _modo_qtd_para_codigo(row)
+    # ✅ Sempre Inteiro
     considerar_anos_flag = st.session_state.get("considerar_anos", "Considerar todas as máquinas como novas")
 
     if considerar_anos_flag == "Considerar com base no ano e estado" and anos_uso >= 1:
         start_prev = (anos_uso - 1) * ha_ano
         end_current = anos_uso * ha_ano
-
-        if modo_qtd == "Inteiro":
-            ciclos_ini = np.floor(start_prev / vida_total)
-            ciclos_fim = np.floor(end_current / vida_total)
-            ciclos = max(0.0, ciclos_fim - ciclos_ini)
-        else:
-            x0 = start_prev / vida_total
-            x1 = end_current / vida_total
-            ciclos = max(0.0, x1 - np.floor(x0))
+        ciclos_ini = np.floor(start_prev / vida_total)
+        ciclos_fim = np.floor(end_current / vida_total)
+        ciclos = max(0.0, ciclos_fim - ciclos_ini)
     else:
         ciclos_raw = ha_ano / vida_total
-        if modo_qtd == "Inteiro":
-            ciclos = np.floor(ciclos_raw)
-        else:
-            ciclos = ciclos_raw
+        ciclos = np.floor(ciclos_raw)
 
     consumo_teorico = ciclos * qtd_total_por_ciclo
     qtd_rec = consumo_teorico * (prop_troca / 100.0)
@@ -393,7 +356,6 @@ def _quantidade_para_maquina_especifica(row, ha_ano_maquina, n_linhas_maquina, a
 
 
 # -------- helper NOVO: página 5 (sempre máquina nova e simulação Ano 1..N) --------
-
 def _quantidade_para_maquina_especifica_plano(row, ha_ano_maquina, n_linhas_maquina, ano_ciclo):
     try:
         vida_base = float(row["hectare_proporcao_efetivo"])
@@ -422,20 +384,13 @@ def _quantidade_para_maquina_especifica_plano(row, ha_ano_maquina, n_linhas_maqu
     if vida_total <= 0:
         return 0.0
 
-    modo_qtd = _modo_qtd_para_codigo(row)
-
+    # ✅ Sempre Inteiro (por ano/ciclo)
     anos_uso = int(max(1, ano_ciclo))
     start_prev = (anos_uso - 1) * ha_ano
     end_current = anos_uso * ha_ano
-
-    if modo_qtd == "Inteiro":
-        ciclos_ini = np.floor(start_prev / vida_total)
-        ciclos_fim = np.floor(end_current / vida_total)
-        ciclos = max(0.0, ciclos_fim - ciclos_ini)
-    else:
-        x0 = start_prev / vida_total
-        x1 = end_current / vida_total
-        ciclos = max(0.0, x1 - np.floor(x0))
+    ciclos_ini = np.floor(start_prev / vida_total)
+    ciclos_fim = np.floor(end_current / vida_total)
+    ciclos = max(0.0, ciclos_fim - ciclos_ini)
 
     consumo_teorico = ciclos * qtd_total_por_ciclo
     qtd_rec = consumo_teorico * (prop_troca / 100.0)
@@ -450,15 +405,14 @@ def _quantidade_recomendada_uma_maquina(row, resumo_maquina_ref):
 
 
 # ---------------- REAPLICAÇÃO DE AJUSTES (respeita apenas o que foi MANUAL) ----------------
-
 def _reaplicar_ajustes(df):
     """
     Reaplica somente os campos ajustados MANUALMENTE em st.session_state['ajustes_pecas'].
 
     ✅ Importação (backup):
-    - Agora pode armazenar 'hect_base' (base antes do modo). Esse ajuste é aplicado
-      na construção do DF (construir_df_pecas). Aqui, reaplicamos apenas o que é
-      manual em nível de 'efetivo' (manual_hect=True) e a proporção.
+    - Armazena 'hect_base' (base antes do modo). Esse ajuste é aplicado
+      na construção do DF (construir_df_pecas).
+    - Aqui reaplicamos apenas o que é manual em nível de 'efetivo' (manual_hect=True) e a proporção.
     """
     ajustes = st.session_state.get("ajustes_pecas", {})
     if not isinstance(ajustes, dict) or df.empty:
@@ -694,7 +648,6 @@ def calcular_indicadores_resumo(df_pecas_proc, resumo_maquina_ref, escopo="Apena
 
 
 # ----------------- AUDITORIA -----------------
-
 def auditar_item(row_item, resumo_maquina_ref):
     try:
         vida_base = float(row_item["hectare_proporcao_efetivo"])
@@ -715,8 +668,8 @@ def auditar_item(row_item, resumo_maquina_ref):
         qtd_total_por_ciclo = qtd_por_prop
 
     ciclos_raw = ha_ano / vida_total if vida_total > 0 else 0
-    modo_qtd = _modo_qtd_para_codigo(row_item)
-    ciclos = np.floor(ciclos_raw) if modo_qtd == "Inteiro" else ciclos_raw
+    # ✅ sempre Inteiro
+    ciclos = np.floor(ciclos_raw)
 
     consumo = ciclos * qtd_total_por_ciclo
     qtd_final = consumo * (prop_troca / 100.0)
@@ -735,14 +688,16 @@ def auditar_item(row_item, resumo_maquina_ref):
 
 
 # =================== Cálculo auxiliar p/ Página 2 ===================
-
 def calcular_hect_ref_e_qtd_prevista(
     row,
     resumo_maquina_ref,
     hectare_efetivo_atual,
-    proporcao_troca_atual,
-    modo_qtd_atual=None
+    proporcao_troca_atual
 ):
+    """
+    ✅ Regra fixa: sempre Inteiro (não exposto no sistema).
+    Retorna: vida_total, qtd_prevista, ciclos
+    """
     try:
         tipo_prop = str(row["Proporção"]).strip().lower()
         n_linhas = int(resumo_maquina_ref.get("linhas_maquina", 1) or 1)
@@ -767,23 +722,15 @@ def calcular_hect_ref_e_qtd_prevista(
     ciclos = 0.0
 
     if vida_total > 0:
-        modo_qtd = modo_qtd_atual if modo_qtd_atual is not None else _modo_qtd_para_codigo(row)
-
         if considerar_anos_flag == "Considerar com base no ano e estado" and anos_uso_ref >= 1:
             start_prev = (anos_uso_ref - 1) * ha_ano
             end_current = anos_uso_ref * ha_ano
-
-            if modo_qtd == "Inteiro":
-                ciclos_ini = np.floor(start_prev / vida_total)
-                ciclos_fim = np.floor(end_current / vida_total)
-                ciclos = max(0.0, ciclos_fim - ciclos_ini)
-            else:
-                x0 = start_prev / vida_total
-                x1 = end_current / vida_total
-                ciclos = max(0.0, x1 - np.floor(x0))
+            ciclos_ini = np.floor(start_prev / vida_total)
+            ciclos_fim = np.floor(end_current / vida_total)
+            ciclos = max(0.0, ciclos_fim - ciclos_ini)
         else:
             ciclos_raw = ha_ano / vida_total
-            ciclos = np.floor(ciclos_raw) if modo_qtd == "Inteiro" else ciclos_raw
+            ciclos = np.floor(ciclos_raw)
 
         consumo_teorico = ciclos * qtd_total_por_ciclo
         qtd_prevista = consumo_teorico * (prop_troca / 100.0)
@@ -792,19 +739,20 @@ def calcular_hect_ref_e_qtd_prevista(
 
 
 # ------------------------------------------------------------
-# === AJUSTES: EXPORT/IMPORT ===
+# === AJUSTES: EXPORT/IMPORT (sem Modo de cálculo) ===
 # ------------------------------------------------------------
-
 def montar_df_ajustes_atual():
     """
     Exporta os valores ATUAIS (efetivos na página 2):
-      Código, Hectare/Proporção, Proporção de troca (%), Modo de cálculo
+      Código, Hectare/Proporção, Proporção de troca (%)
     """
     df = st.session_state.get("df_pecas_proc")
     if df is None or df.empty:
-        return pd.DataFrame(columns=["Código", "Hectare/Proporção", "Proporção de troca (%)", "Modo de cálculo"])
+        return pd.DataFrame(columns=["Código", "Hectare/Proporção", "Proporção de troca (%)"])
+
     tmp = df.copy()
     tmp["Código"] = tmp["Código"].apply(format_codigo)
+
     base = (
         tmp.groupby("Código", as_index=False)
         .agg({
@@ -818,7 +766,6 @@ def montar_df_ajustes_atual():
         .sort_values("Código")
         .reset_index(drop=True)
     )
-    base["Modo de cálculo"] = base["Código"].apply(lambda c: _modo_qtd_para_codigo(c))
     return base
 
 
@@ -833,18 +780,17 @@ def gerar_planilha_ajustes():
 
 def aplicar_importacao_ajustes(df_import):
     """
-    ✅ Correção solicitada:
-    - Importação NÃO deve travar o modo de operação.
-    - O 'Hectare/Proporção' importado (que vem como efetivo) é convertido em BASE,
+    ✅ Regras:
+    - Importação NÃO trava o modo de operação.
+    - O 'Hectare/Proporção' importado (efetivo) é convertido em BASE,
       dividindo pelo multiplicador do modo atual, e armazenado como 'hect_base'.
-    - Assim: ao mudar Leve/Moderado/Extremo, o valor volta a responder normalmente.
+    - Importação NÃO considera (nem aceita) "Modo de cálculo" (regra fixa: Inteiro).
     """
     if df_import is None or df_import.empty:
         return False, "Arquivo vazio ou inválido."
 
     cols = {c.strip().lower(): c for c in df_import.columns}
     req = {"código": None, "hectare/proporção": None, "proporção de troca (%)": None}
-    opt_modo_col = None
 
     for k in list(req.keys()):
         if k in cols:
@@ -852,31 +798,14 @@ def aplicar_importacao_ajustes(df_import):
     if None in req.values():
         return False, "As colunas obrigatórias são: Código, Hectare/Proporção, Proporção de troca (%)."
 
-    if "modo de cálculo" in cols:
-        opt_modo_col = cols["modo de cálculo"]
-
     df = df_import[[req["código"], req["hectare/proporção"], req["proporção de troca (%)"]]].copy()
     df.columns = ["Código", "Hectare/Proporção", "Proporção de troca (%)"]
-
-    if opt_modo_col is not None:
-        df["Modo de cálculo"] = df_import[opt_modo_col]
-        df["Modo de cálculo"] = (
-            df["Modo de cálculo"]
-            .astype(str)
-            .str.strip()
-            .str.capitalize()
-            .replace({"Proporcional": "Proporcional", "Inteiro": "Inteiro"})
-        )
-        df.loc[~df["Modo de cálculo"].isin(["Proporcional", "Inteiro"]), "Modo de cálculo"] = np.nan
-    else:
-        df["Modo de cálculo"] = np.nan
 
     df["Código"] = df["Código"].apply(format_codigo)
     df["Hectare/Proporção"] = pd.to_numeric(df["Hectare/Proporção"], errors="coerce").fillna(0.0)
     df["Proporção de troca (%)"] = pd.to_numeric(df["Proporção de troca (%)"], errors="coerce").fillna(0.0).astype(int)
 
     ajustes = st.session_state.get("ajustes_pecas", {}).copy()
-    modo_global = st.session_state.get("modo_calculo_qtd", "Proporcional")
 
     # ✅ Converte efetivo importado para BASE (antes do modo)
     mult_atual = _get_mult_modo(st.session_state.get("modo_operacao", "Moderado"))
@@ -887,17 +816,6 @@ def aplicar_importacao_ajustes(df_import):
         cod = r["Código"]
         antigo = ajustes.get(cod, {})
 
-        modo_importado = (
-            r["Modo de cálculo"]
-            if isinstance(r.get("Modo de cálculo", np.nan), str) and r["Modo de cálculo"] in ["Proporcional", "Inteiro"]
-            else antigo.get("modo_qtd", None)
-        )
-
-        if modo_importado is None:
-            modo_importado = antigo.get("modo_qtd", modo_global)
-
-        manual_modo = (modo_importado != modo_global)
-
         hect_efetivo_import = float(r["Hectare/Proporção"])
         hect_base_import = hect_efetivo_import / mult_atual
 
@@ -906,15 +824,12 @@ def aplicar_importacao_ajustes(df_import):
             "hect_base": float(hect_base_import),
             "manual_hect_base": True,
 
-            # mantém compatibilidade (não travar efetivo)
+            # mantém compatibilidade com ajuste manual efetivo (se existir)
             "hect": antigo.get("hect", None),
             "manual_hect": antigo.get("manual_hect", False),
 
             "prop": int(r["Proporção de troca (%)"]),
             "manual_prop": True,
-
-            "modo_qtd": modo_importado,
-            "manual_modo": manual_modo,
         }
 
     st.session_state["ajustes_pecas"] = ajustes
@@ -928,7 +843,6 @@ def aplicar_importacao_ajustes(df_import):
 # ------------------------------------------------------------
 # Assinatura (para evitar reset ao navegar) + Reprocessamento central
 # ------------------------------------------------------------
-
 def _assinatura_atual():
     mults = st.session_state.get("multiplicadores_operacao",
                                  {"Leve": 1.30, "Moderado": 1.00, "Extremo": 0.70})
@@ -942,7 +856,6 @@ def _assinatura_atual():
         st.session_state.get("hectare_hora_ref"),
         st.session_state.get("largura_ref_m"),
         st.session_state.get("modo_operacao"),
-        st.session_state.get("modo_calculo_qtd"),
         st.session_state.get("considerar_anos"),
         float(mults.get("Leve", 1.30)),
         float(mults.get("Moderado", 1.00)),
@@ -989,13 +902,6 @@ def run_processamento_if_needed(show_msg=False):
 
         st.session_state["assinatura_processamento"] = nova_assinatura
 
-        ajustes = st.session_state.get("ajustes_pecas", {})
-        for cod, vals in ajustes.items():
-            if not vals.get("manual_modo", False):
-                key = f"modo_qtd_{format_codigo(cod)}"
-                if key in st.session_state:
-                    del st.session_state[key]
-
         if show_msg:
             st.success("Dados reprocessados com base nos parâmetros atuais.")
     else:
@@ -1006,7 +912,6 @@ def run_processamento_if_needed(show_msg=False):
 # ------------------------------------------------------------
 # Layout principal (páginas)
 # ------------------------------------------------------------
-
 init_session_state()
 
 st.sidebar.image(
@@ -1205,22 +1110,9 @@ if pagina == "1. Entrada de Dados":
     )
 
     st.markdown("---")
-    st.subheader("Modo de cálculo da quantidade de peças")
-
-    st.session_state["modo_calculo_qtd"] = st.radio(
-        "Como calcular a quantidade recomendada de peças?",
-        ["Proporcional", "Inteiro"],
-        horizontal=True,
-        index=(0 if st.session_state["modo_calculo_qtd"] == "Proporcional" else 1)
-    )
-
-    st.caption(
-        "- **Proporcional**: usa frações de ciclo (ex.: 1,5x da quantidade recomendada).\n"
-        "- **Inteiro**: só considera ciclos completos (ex.: 1x até completar 2x a vida da peça)."
-    )
+    st.caption("⚙️ Regra do sistema: o cálculo de quantidade de peças é sempre feito no modo **Inteiro** (ciclos completos).")
 
     st.markdown("---")
-
     run_processamento_if_needed(show_msg=True)
 
 
@@ -1262,7 +1154,7 @@ elif pagina == "2. Ajustes de Peças":
                 )
             with c2:
                 up_file = st.file_uploader(
-                    "Importar ajustes (.xlsx) com colunas: Código, Hectare/Proporção, Proporção de troca (%), Modo de cálculo (opcional)",
+                    "Importar ajustes (.xlsx) com colunas: Código, Hectare/Proporção, Proporção de troca (%)",
                     type=["xlsx"],
                     key="upload_ajustes_xlsx"
                 )
@@ -1368,8 +1260,6 @@ elif pagina == "2. Ajustes de Peças":
                 v = 0.0
             st.session_state[kh] = (v / nlin) if (tipo_lower == "linha" and nlin > 0) else v
 
-        modo_global = st.session_state.get("modo_calculo_qtd", "Proporcional")
-
         for _, row in df_unique.iterrows():
             codigo_item = format_codigo(row["Código"])
             st.markdown("---")
@@ -1379,12 +1269,6 @@ elif pagina == "2. Ajustes de Peças":
             base_prop = int(row["proporcao_troca_%"])
 
             aj = ajustes.get(codigo_item, {})
-            manual_modo_flag = aj.get("manual_modo", False)
-
-            if manual_modo_flag and aj.get("modo_qtd") in ["Proporcional", "Inteiro"]:
-                default_modo = aj["modo_qtd"]
-            else:
-                default_modo = modo_global
 
             default_hect = float(aj["hect"]) if aj.get("manual_hect", False) and ("hect" in aj) else base_hect
             default_prop = int(aj["prop"]) if aj.get("manual_prop", False) and ("prop" in aj) else base_prop
@@ -1412,17 +1296,7 @@ elif pagina == "2. Ajustes de Peças":
                 st.write(f"Família: {row['Família']}")
                 st.write(f"Custo unitário: {format_currency(row['custo_unitario'])}")
                 st.write(f"Custo total: {format_currency(row['custo_total_base'])}")
-
-                key_modo = f"modo_qtd_{codigo_item}"
-                if key_modo not in st.session_state:
-                    st.session_state[key_modo] = default_modo
-
-                modo_escolhido = st.radio(
-                    "Modo de cálculo",
-                    ["Proporcional", "Inteiro"],
-                    horizontal=True,
-                    key=key_modo
-                )
+                st.caption("⚙️ Regra do sistema: cálculo de quantidade sempre **Inteiro** (ciclos completos).")
 
             with cB:
                 key_hect = f"hectare_prop_{codigo_item}"
@@ -1441,7 +1315,7 @@ elif pagina == "2. Ajustes de Peças":
                 if key_prop not in st.session_state:
                     st.session_state[key_prop] = int(default_prop)
 
-                new_hectare_prop = st.number_input(
+                _ = st.number_input(
                     "Hectare/Proporção",
                     min_value=0.0,
                     step=1.0,
@@ -1450,7 +1324,7 @@ elif pagina == "2. Ajustes de Peças":
                     on_change=lambda kh=key_hect, kr=key_ref, t=tipo_prop_lower, nl=n_linhas_ref: cb_from_hect(kh, kr, t, nl)
                 )
 
-                new_ref_input = st.number_input(
+                _ = st.number_input(
                     "Hectare referência",
                     min_value=0.0,
                     step=1.0,
@@ -1459,7 +1333,7 @@ elif pagina == "2. Ajustes de Peças":
                     on_change=lambda kh=key_hect, kr=key_ref, t=tipo_prop_lower, nl=n_linhas_ref: cb_from_ref(kh, kr, t, nl)
                 )
 
-                new_prop_troca = st.slider(
+                _ = st.slider(
                     "Proporção de troca (%)",
                     min_value=0, max_value=100,
                     value=int(st.session_state[key_prop]),
@@ -1473,13 +1347,9 @@ elif pagina == "2. Ajustes de Peças":
                     resumo_ref,
                     synced_hect,
                     int(st.session_state[key_prop]),
-                    modo_qtd_atual=modo_escolhido
                 )
                 st.write(f"**Quantidade prevista**: {int(round(qtd_prevista))}")
-                if modo_escolhido == "Inteiro":
-                    st.write(f"**Quantidade de ciclos:** {int(np.floor(qtd_ciclos))}")
-                else:
-                    st.write(f"**Quantidade de ciclos:** {qtd_ciclos:.2f}")
+                st.write(f"**Quantidade de ciclos:** {int(np.floor(qtd_ciclos))}")
 
             with cC:
                 st.write(f"Proporção declarada: {row['Proporção']}")
@@ -1501,7 +1371,6 @@ elif pagina == "2. Ajustes de Peças":
             tol = 1e-9
             manual_hect = abs(float(synced_hect) - float(base_hect)) > tol
             manual_prop = int(st.session_state[key_prop]) != int(base_prop)
-            manual_modo = (modo_escolhido != modo_global)
 
             antigo = ajustes.get(codigo_item, {})
 
@@ -1510,8 +1379,6 @@ elif pagina == "2. Ajustes de Peças":
                 "prop": int(st.session_state[key_prop]) if manual_prop else antigo.get("prop"),
                 "manual_hect": manual_hect or antigo.get("manual_hect", False),
                 "manual_prop": manual_prop or antigo.get("manual_prop", False),
-                "modo_qtd": modo_escolhido,
-                "manual_modo": manual_modo,
 
                 # mantém possíveis bases importadas
                 "hect_base": antigo.get("hect_base"),
@@ -1700,7 +1567,7 @@ elif pagina == "3. Resumo / Resultados":
         )
 
         st.download_button(
-            label="⬇️ Exportar",
+            label="Exportar Excel",
             data=buffer_xlsx,
             file_name="planejamento_manutencao.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -1708,7 +1575,7 @@ elif pagina == "3. Resumo / Resultados":
 
 
 # ------------------------------------------------------------
-# PÁGINA 4 - Análise operacional
+# PÁGINA 4 - Análise operacional (mantida como estava; rótulos já existentes)
 # ------------------------------------------------------------
 elif pagina == "4. Análise operacional":
     st.title("4. Análise operacional")
@@ -2015,7 +1882,7 @@ elif pagina == "4. Análise operacional":
                         buffer_p4.seek(0)
 
                         st.download_button(
-                            label="⬇️ Exportar",
+                            label="Exportar tabela da análise operacional (Excel)",
                             data=buffer_p4,
                             file_name="analise_operacional.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -2093,7 +1960,6 @@ elif pagina == "4. Análise operacional":
                                         .interactive()
                                     )
 
-                                    # ✅ RÓTULOS (DATA LABELS) conforme métrica selecionada
                                     label_field = "Quantidade_str:N" if metrica_graf == "Quantidade de peças" else "Custo_str:N"
                                     labels = (
                                         alt.Chart(chart_month)
@@ -2111,7 +1977,7 @@ elif pagina == "4. Análise operacional":
 
 
 # ------------------------------------------------------------
-# PÁGINA 5 - Plano de Manutenção
+# PÁGINA 5 - Plano de Manutenção (com botão XLSX do gráfico - 3 colunas)
 # ------------------------------------------------------------
 elif pagina == "5. Plano de Manutenção":
     st.title("5. Plano de Manutenção")
@@ -2340,7 +2206,7 @@ elif pagina == "5. Plano de Manutenção":
                         buffer_p5.seek(0)
 
                         st.download_button(
-                            label="⬇️ Exportar",
+                            label="⬇️ Exportar Plano de Manutenção (Excel .xlsx)",
                             data=buffer_p5,
                             file_name="plano_manutencao.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -2386,7 +2252,7 @@ elif pagina == "5. Plano de Manutenção":
                         buffer_graf_p5.seek(0)
 
                         st.download_button(
-                            label="⬇️ Exportar",
+                            label="⬇️ Exportar dados do gráfico (Excel .xlsx)",
                             data=buffer_graf_p5,
                             file_name="dados_grafico_plano_manutencao.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
