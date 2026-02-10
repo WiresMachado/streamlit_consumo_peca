@@ -1700,7 +1700,7 @@ elif pagina == "3. Resumo / Resultados":
         )
 
         st.download_button(
-            label="Exportar Excel",
+            label="⬇️ Exportar",
             data=buffer_xlsx,
             file_name="planejamento_manutencao.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -2015,7 +2015,7 @@ elif pagina == "4. Análise operacional":
                         buffer_p4.seek(0)
 
                         st.download_button(
-                            label="Exportar tabela da análise operacional (Excel)",
+                            label="⬇️ Exportar",
                             data=buffer_p4,
                             file_name="analise_operacional.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -2227,7 +2227,7 @@ elif pagina == "5. Plano de Manutenção":
                     df_plano = pd.DataFrame(linhas_out)
 
                     # ----------------------------
-                    # ✅ Indicadores (similar ao Resumo/Resultados)
+                    # Indicadores (similar ao Resumo/Resultados)
                     # ----------------------------
                     custo_total_periodo = float(df_plano["Custo total (R$)"].sum()) if not df_plano.empty else 0.0
                     total_ha_periodo = float(ha_ano_maq) * float(tempo_anos)
@@ -2340,7 +2340,7 @@ elif pagina == "5. Plano de Manutenção":
                         buffer_p5.seek(0)
 
                         st.download_button(
-                            label="Exportar Plano de Manutenção (Excel)",
+                            label="⬇️ Exportar",
                             data=buffer_p5,
                             file_name="plano_manutencao.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -2377,6 +2377,24 @@ elif pagina == "5. Plano de Manutenção":
                         df_g["Ano_num"] = df_g["Ano"].apply(_ano_num)
                         df_g = df_g.sort_values("Ano_num").reset_index(drop=True)
 
+                        # --------- ✅ EXPORTAR DADOS DO GRÁFICO EM XLSX (APENAS 3 COLUNAS) ---------
+                        df_g_export = df_g[["Ano", "Custo total (R$)", "Custo por hectare (R$/ha)"]].copy()
+
+                        buffer_graf_p5 = BytesIO()
+                        with pd.ExcelWriter(buffer_graf_p5, engine="xlsxwriter") as writer:
+                            df_g_export.to_excel(writer, index=False, sheet_name="Dados_grafico")
+                        buffer_graf_p5.seek(0)
+
+                        st.download_button(
+                            label="⬇️ Exportar",
+                            data=buffer_graf_p5,
+                            file_name="dados_grafico_plano_manutencao.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True
+                        )
+                        st.caption("Obs.: o menu do gráfico exporta CSV; para Excel (.xlsx), use o botão acima.")
+
+                        # --------- GRÁFICO ---------
                         df_g["CustoTotal_str"] = df_g["Custo total (R$)"].apply(format_currency)
                         df_g["CustoHa_str"] = df_g["Custo por hectare (R$/ha)"].apply(format_currency)
 
@@ -2395,7 +2413,7 @@ elif pagina == "5. Plano de Manutenção":
                             .interactive()
                         )
 
-                        # ✅ RÓTULOS (DATA LABELS) conforme seleção
+                        # RÓTULOS (DATA LABELS) conforme seleção
                         label_field = "CustoTotal_str:N" if metrica == "Custo total (R$)" else "CustoHa_str:N"
                         labels = (
                             alt.Chart(df_g)
