@@ -52,7 +52,7 @@ def init_session_state():
         # Assinatura do processamento para evitar reconstrução desnecessária
         "assinatura_processamento": None,
 
-        # Parâmetros globais ajustáveis
+        # Parâmetros globais ajustáveis (fallback quando a peça não traz Proporção de troca na planilha)
         "default_proporcao_troca": 50,
 
         # ✅ AJUSTE SOLICITADO: Leve=1.30 / Extremo=0.70
@@ -150,6 +150,12 @@ def higienizar_pecas(df_pecas):
     df = df_pecas.copy()
     if "Código" in df.columns:
         df["Código"] = df["Código"].apply(format_codigo)
+
+    # ✅ NOVO: higieniza "Proporção de troca (%)" (0..100)
+    if "Proporção de troca (%)" in df.columns:
+        df["Proporção de troca (%)"] = pd.to_numeric(df["Proporção de troca (%)"], errors="coerce")
+        df["Proporção de troca (%)"] = df["Proporção de troca (%)"].clip(lower=0, upper=100)
+
     return df
 
 
@@ -499,8 +505,14 @@ def construir_df_pecas(df_pecas, df_custos, resumo_maquina_ref, modo_operacao):
         lambda v: aplicar_modo_operacao(v, st.session_state["modo_operacao"])
     )
 
-    # Proporção padrão global
-    df["proporcao_troca_%"] = float(st.session_state.get("default_proporcao_troca", 50))
+    # ✅ NOVO: proporção de troca padrão por peça (vinda da planilha Peças) com fallback no default global
+    default_global = float(st.session_state.get("default_proporcao_troca", 50))
+    if "Proporção de troca (%)" in df.columns:
+        prop_col = pd.to_numeric(df["Proporção de troca (%)"], errors="coerce")
+        prop_col = prop_col.clip(lower=0, upper=100)
+        df["proporcao_troca_%"] = prop_col.fillna(default_global).astype(float)
+    else:
+        df["proporcao_troca_%"] = float(default_global)
 
     df["custo_unitario"] = df["Custo"]
     df["custo_total_base"] = df["Qtd/Proporção"] * df["custo_unitario"]
@@ -930,7 +942,6 @@ pagina = st.sidebar.radio(
     ]
 )
 
-
 # ------------------------------------------------------------
 # PÁGINA 1 - Entrada de Dados
 # ------------------------------------------------------------
@@ -960,6 +971,13 @@ if pagina == "1. Entrada de Dados":
             prev_pecas = higienizar_pecas(st.session_state["df_pecas_raw"]).copy()
             if "Hectare/Proporção" in prev_pecas.columns:
                 prev_pecas["Hectare/Proporção"] = prev_pecas["Hectare/Proporção"].apply(format_thousand_no_decimals)
+            if "Proporção de troca (%)" in prev_pecas.columns:
+                prev_pecas["Proporção de troca (%)"] = (
+                    pd.to_numeric(prev_pecas["Proporção de troca (%)"], errors="coerce")
+                    .fillna(0)
+                    .clip(0, 100)
+                    .astype(int)
+                )
             st.write("Peças (formatado p/ visualização):", prev_pecas)
 
         if st.session_state["df_custos_raw"] is not None:
@@ -1057,11 +1075,11 @@ if pagina == "1. Entrada de Dados":
         st.caption("Os multiplicadores acima são aplicados sobre o Hectare/Proporção de cada peça (base).")
 
         st.session_state["default_proporcao_troca"] = st.slider(
-            "Proporção de troca padrão (%)",
+            "Proporção de troca padrão (%) (fallback quando a peça não traz na planilha)",
             min_value=0, max_value=100, step=1,
             value=int(st.session_state["default_proporcao_troca"])
         )
-        st.caption("Esse valor inicial pode ser alterado peça a peça na página 2.")
+        st.caption("Se a planilha de peças tiver a coluna 'Proporção de troca (%)', ela prevalece como padrão por peça.")
 
     chassi_opcoes = []
     if (
@@ -1266,7 +1284,7 @@ elif pagina == "2. Ajustes de Peças":
             st.subheader(f"{codigo_item} - {row['Descrição']}")
 
             base_hect = float(row["hectare_proporcao_efetivo"])
-            base_prop = int(row["proporcao_troca_%"])
+            base_prop = int(round(float(row["proporcao_troca_%"])))  # ✅ agora pode vir da planilha de peças
 
             aj = ajustes.get(codigo_item, {})
 
@@ -1355,6 +1373,7 @@ elif pagina == "2. Ajustes de Peças":
                 st.write(f"Proporção declarada: {row['Proporção']}")
                 st.write(f"Qtd/Proporção: {row['Qtd/Proporção']}")
                 st.write(f"Hectare/Proporção (original): {format_hectare_original(row['Hectare/Proporção'])}")
+                st.write(f"Proporção de troca (base): {int(round(base_prop))}%")
                 st.write(f"Linhas do chassi (ref): {n_linhas_ref}")
 
                 ha_hora_maquina = float(resumo_ref.get("ha_hora_maquina", 0.0) or 0.0)
