@@ -1157,7 +1157,7 @@ elif pagina == "2. Ajustes de Peças":
         )
 
         st.write("Edite os parâmetros peça a peça. Esses ajustes alimentam os cálculos finais.")
-        st.write("Os valores **permanecem salvos** ao alternar páginas; só se perdem ao recarregar o app ou importar novas tabelas.")
+        # ✅ REMOVIDO: mensagem sobre persistência ao alternar páginas
 
         with st.expander("Exportar / Importar ajustes (backup)"):
             c1, c2 = st.columns([1, 2])
@@ -1284,7 +1284,7 @@ elif pagina == "2. Ajustes de Peças":
             st.subheader(f"{codigo_item} - {row['Descrição']}")
 
             base_hect = float(row["hectare_proporcao_efetivo"])
-            base_prop = int(round(float(row["proporcao_troca_%"])))  # ✅ agora pode vir da planilha de peças
+            base_prop = int(round(float(row["proporcao_troca_%"])))
 
             aj = ajustes.get(codigo_item, {})
 
@@ -1314,7 +1314,7 @@ elif pagina == "2. Ajustes de Peças":
                 st.write(f"Família: {row['Família']}")
                 st.write(f"Custo unitário: {format_currency(row['custo_unitario'])}")
                 st.write(f"Custo total: {format_currency(row['custo_total_base'])}")
-                st.caption("⚙️ Regra do sistema: cálculo de quantidade sempre **Inteiro** (ciclos completos).")
+                # ✅ REMOVIDO: "⚙️ Regra do sistema..." dentro da página 2
 
             with cB:
                 key_hect = f"hectare_prop_{codigo_item}"
@@ -1372,8 +1372,8 @@ elif pagina == "2. Ajustes de Peças":
             with cC:
                 st.write(f"Proporção declarada: {row['Proporção']}")
                 st.write(f"Qtd/Proporção: {row['Qtd/Proporção']}")
-                st.write(f"Hectare/Proporção (original): {format_hectare_original(row['Hectare/Proporção'])}")
-                st.write(f"Proporção de troca (base): {int(round(base_prop))}%")
+                # ✅ REMOVIDO: "Hectare/Proporção (original): ..." (texto + valor)
+                # ✅ REMOVIDO: "Proporção de troca (base): ..." (texto + valor)
                 st.write(f"Linhas do chassi (ref): {n_linhas_ref}")
 
                 ha_hora_maquina = float(resumo_ref.get("ha_hora_maquina", 0.0) or 0.0)
@@ -1453,6 +1453,49 @@ elif pagina == "3. Resumo / Resultados":
             index=(0 if st.session_state["escopo_resumo"] == "Apenas chassi selecionado" else 1)
         )
 
+        # ✅ TABELA: informações do(s) chassi(s) conforme seleção da página 1 (SEM anualização)
+        st.markdown("---")
+        st.subheader("Informações da máquina (conforme seleção da Página 1)")
+
+        df_maqs = st.session_state.get("df_maquinas_raw")
+        df_maqs_proc = st.session_state.get("df_maquinas_proc")
+        modelo_sel = st.session_state.get("modelo_selecionado")
+        chassi_sel = st.session_state.get("chassi_selecionado")
+
+        info_rows = []
+        if df_maqs is not None and not df_maqs.empty and modelo_sel:
+            tmp = df_maqs.copy()
+            tmp = tmp[tmp["Modelo"] == modelo_sel].copy()
+            if "Chassi" in tmp.columns:
+                tmp["Chassi"] = tmp["Chassi"].astype(str)
+            if chassi_sel and chassi_sel != "Todos":
+                tmp = tmp[tmp["Chassi"].astype(str) == str(chassi_sel)].copy()
+
+            # tenta trazer anos_uso da base processada (quando existir)
+            anos_uso_map = {}
+            if df_maqs_proc is not None and not df_maqs_proc.empty and "Chassi" in df_maqs_proc.columns:
+                tp = df_maqs_proc.copy()
+                tp["Chassi"] = tp["Chassi"].astype(str)
+                if "anos_uso" in tp.columns:
+                    anos_uso_map = dict(zip(tp["Chassi"], tp["anos_uso"]))
+
+            for _, r in tmp.iterrows():
+                ch = str(r.get("Chassi", ""))
+                info_rows.append({
+                    "Chassi": ch,
+                    "Linhas": int(r.get("Linhas", 0) or 0) if pd.notna(r.get("Linhas", np.nan)) else 0,
+                    "Espaçamento": float(r.get("Espaçamento", 0.0) or 0.0) if pd.notna(r.get("Espaçamento", np.nan)) else 0.0,
+                    "Ano": format_ano(r.get("Ano", "")),
+                    "Estado": str(r.get("Estado", "Novo")).strip().capitalize() if "Estado" in tmp.columns else "Novo",
+                    "Anos de uso (calculado)": int(anos_uso_map.get(ch, 1) or 1)
+                })
+
+        df_info = pd.DataFrame(info_rows)
+        if df_info.empty:
+            st.info("Sem dados suficientes para exibir as informações da máquina.")
+        else:
+            st.dataframe(df_info, use_container_width=True, hide_index=True)
+
         indicadores = calcular_indicadores_resumo(
             st.session_state["df_pecas_proc"],
             resumo_ref,
@@ -1494,6 +1537,7 @@ elif pagina == "3. Resumo / Resultados":
 
         st.subheader(f"Consumo projetado de peças ({st.session_state['escopo_resumo'].lower()})")
 
+        # ✅ IMPORTANTE: NÃO anualizar (removido pedido de coluna "Ano")
         df_export_preview_num = agregar_para_exportacao(
             st.session_state["df_pecas_proc"],
             resumo_ref,
