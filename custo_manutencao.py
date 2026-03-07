@@ -553,6 +553,180 @@ def recalcular_pecas_pos_ajuste(df_pecas_proc, resumo_maquina_ref):
     df["custo_planejado_item"] = df["qtd_recomendada"] * df["custo_unitario"]
     return df
 
+def _format_tamanho_bi(linhas, espacamento):
+    """
+    Regras:
+    - com linhas e espaçamento: '7.45'
+    - com linhas e sem espaçamento: '7'
+    """
+    try:
+        linhas_str = str(int(float(linhas))) if pd.notna(linhas) else ""
+    except Exception:
+        linhas_str = str(linhas).strip() if linhas is not None else ""
+
+    try:
+        if pd.isna(espacamento) or str(espacamento).strip() == "":
+            return linhas_str
+
+        esp_float = float(espacamento)
+
+        # Se for inteiro exato, mostra sem casas
+        if esp_float.is_integer():
+            esp_str = str(int(esp_float))
+        else:
+            esp_str = str(esp_float).replace(".", ",")  # opcional para exibição BR
+            esp_str = esp_str.replace(",", ".")         # mantém formato pedido: 7.45
+
+        return f"{linhas_str}.{esp_str}"
+    except Exception:
+        return linhas_str
+
+
+def _aplicar_modo_operacao_em_df_bi(df_base, modo):
+    """
+    Recalcula somente o hectare_proporcao_efetivo conforme o modo,
+    preservando a base já ajustada e a proporção de troca da peça.
+    """
+    df = df_base.copy()
+
+    # Usa hectare_prop_base quando existir; senão usa o efetivo atual como fallback
+    if "hectare_prop_base" in df.columns:
+        df["hectare_proporcao_efetivo"] = df["hectare_prop_base"].apply(
+            lambda v: aplicar_modo_operacao(v, modo)
+        )
+    else:
+        # fallback defensivo
+        mult_atual = _get_mult_modo(st.session_state.get("modo_operacao", "Moderado"))
+        mult_novo = _get_mult_modo(modo)
+        if mult_atual == 0:
+            mult_atual = 1.0
+
+        df["hectare_proporcao_efetivo"] = (
+            pd.to_numeric(df["hectare_proporcao_efetivo"], errors="coerce").fillna(0.0) / mult_atual
+        ) * mult_novo
+
+    return df
+
+
+def gerar_base_bi_plano_manutencao(chassi_p5, tempo_anos):
+    """
+    Gera a base completa para BI com os 3 modos empilhados:
+    Leve, Moderado e Extremo.
+    """
+    df_maqs_proc = st.session_state.get("df_maquinas_proc")
+    df_maqs_raw = st.session_state.get("df_maquinas_raw")
+    df_pecas_proc = st.session_state.get("df_pecas_proc")
+
+    if (
+        df_maqs_proc is None or df_maqs_proc.empty or
+        df_pecas_proc is None or df_pecas_proc.empty
+    ):
+        return pd.DataFrame()
+
+    df_maqs_proc = df_maqs_proc.copy()
+    df_maqs_proc["Chassi"] = df_maqs_proc["Chassi"].astype(str)
+
+    row_proc = df_maqs_proc[df_maqs_proc["Chassi"] == str(chassi_p5)]
+    if row_proc.empty:
+        return pd.DataFrame()
+    row_proc = row_proc.iloc[0]
+
+    row_raw = None
+    if df_maqs_raw is not None and not df_maqs_raw.empty and "Chassi" in df_maqs_raw.columns:
+        tmp_raw = df_maqs_raw.copy()
+        tmp_raw["Chassi"] = tmp_raw["Chassi"].astype(str)
+        rr = tmp_raw[tmp_raw["Chassi"] == str(chassi_p5)]
+        if not rr.empty:
+            row_raw = rr.iloc[0]
+
+    modelo = row_raw.get("Modelo") if row_raw is not None else row_proc.get("Modelo")
+    linhas = row_raw.get("Linhas") if row_raw is not None else row_proc.get("Linhas")
+    espacamento = row_raw.get("Espaçamento") if row_raw is not None else row_proc.get("Espaçamento")
+    tamanho = _format_tamanho_bi(linhas, espacamento)
+
+    ha_ano_maq = float(row_proc.get("ha_ano_chassi", 0.0) or 0.0)
+    ha_hora_maq = float(row_proc.get("ha_hora_chassi", 0.0) or 0.0)
+    n_linhas_maq = int(row_proc.get("Linhas", 1) or 1)
+
+    if ha_ano_maq <= 0:
+        return pd.DataFrame()
+
+    horas_ano_maq = (ha_ano_maq / ha_hora_maq) if ha_hora_maq > 0 else 0.0
+
+    # Base única por código
+    df_base = df_pecas_proc.copy()
+    df_base = df_base.groupby("Código", as_index=False).first().reset_index(drop=True)
+    df_base["Código"] = df_base["Código"].apply(format_codigo)
+
+    modos = ["Leve", "Moderado", "Extremo"]
+    linhas_out = []
+
+    for modo in modos:
+        df_modo = _aplicar_modo_operacao_em_df_bi(df_base, modo)
+
+        for ano_ciclo in range(1, int(tempo_anos) + 1):
+            ano_label = f"Ano {ano_ciclo}"
+            hectare_acumulado = ha_ano_maq * ano_ciclo
+            horas_acumuladas = horas_ano_maq * ano_ciclo
+
+            for _, p in df_modo.iterrows():
+                qtd = _quantidade_para_maquina_especifica_plano(
+                    p, ha_ano_maq, n_linhas_maq, ano_ciclo
+                )
+
+                if qtd <= 0:
+                    continue
+
+                custo_unit = float(p.get("custo_unitario", 0.0) or 0.0)
+                custo_total = float(qtd) * custo_unit
+
+                linhas_out.append({
+                    "Modelo": modelo,
+                    "Tamanho": tamanho,
+                    "Modo operação": modo,
+                    "Ano": ano_label,
+                    "Hectare": float(hectare_acumulado),
+                    "Horas": float(horas_acumuladas),
+                    "Família": p.get("Família", ""),
+                    "Código": format_codigo(p.get("Código", "")),
+                    "Descrição": p.get("Descrição", ""),
+                    "Qtd recomendada": int(round(qtd)),
+                    "Custo total (R$)": float(custo_total),
+                })
+
+    df_bi = pd.DataFrame(linhas_out)
+
+    if df_bi.empty:
+        return df_bi
+
+    def _ano_num(x):
+        try:
+            return int(str(x).lower().replace("ano", "").strip())
+        except Exception:
+            return 999999
+
+    ordem_modo = {"Leve": 1, "Moderado": 2, "Extremo": 3}
+    df_bi["__ord_modo"] = df_bi["Modo operação"].map(ordem_modo).fillna(999)
+    df_bi["__ord_ano"] = df_bi["Ano"].apply(_ano_num)
+
+    df_bi = df_bi.sort_values(
+        by=["__ord_modo", "__ord_ano", "Família", "Código"],
+        ascending=[True, True, True, True]
+    ).reset_index(drop=True)
+
+    df_bi = df_bi.drop(columns=["__ord_modo", "__ord_ano"])
+
+    return df_bi
+
+
+def gerar_excel_bi_plano_manutencao(chassi_p5, tempo_anos):
+    df_bi = gerar_base_bi_plano_manutencao(chassi_p5, tempo_anos)
+
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+        df_bi.to_excel(writer, index=False, sheet_name="Dados_BI")
+    buffer.seek(0)
+    return buffer
 
 def agregar_para_exportacao(df_pecas_proc, resumo_maquina_ref, familia_filter="Todos", escopo="Apenas chassi selecionado"):
     if df_pecas_proc is None or df_pecas_proc.empty:
@@ -2355,3 +2529,18 @@ elif pagina == "5. Plano de Manutenção":
                         )
 
                         st.altair_chart(chart + labels, use_container_width=True)
+
+                        st.markdown("---")
+
+                        buffer_bi = gerar_excel_bi_plano_manutencao(
+                            chassi_p5=chassi_p5,
+                            tempo_anos=tempo_anos
+                        )
+
+                        st.download_button(
+                            label="Dados BI",
+                            data=buffer_bi,
+                            file_name="dados_bi_plano_manutencao.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True
+                        )
