@@ -82,9 +82,10 @@ def init_session_state():
         # ---------------------------
         # Página 6 - Confiabilidade
         # ---------------------------
-        "df_beta_raw": None,
+         "df_beta_raw": None,
         "beta_import_filename": None,
         "codigo_confiabilidade_sel": None,
+        "confiab_chassi_selecionado": None,
 
     }
     for k, v in defaults.items():
@@ -564,9 +565,10 @@ def recalcular_pecas_pos_ajuste(df_pecas_proc, resumo_maquina_ref):
 
 def _format_tamanho_bi(linhas, espacamento):
     """
-    Regras:
-    - com linhas e espaçamento: '7.45'
-    - com linhas e sem espaçamento: '7'
+    Exemplo:
+    7 linhas e 50 de espaçamento -> 7.50
+    7 linhas e 45 de espaçamento -> 7.45
+    sem espaçamento -> 7
     """
     try:
         linhas_str = str(int(float(linhas))) if pd.notna(linhas) else ""
@@ -579,13 +581,12 @@ def _format_tamanho_bi(linhas, espacamento):
 
         esp_float = float(espacamento)
 
-        # Se for inteiro exato, mostra sem casas
         if esp_float.is_integer():
             esp_str = str(int(esp_float))
         else:
-            esp_str = str(esp_float).replace(".", ",")  # opcional para exibição BR
-            esp_str = esp_str.replace(",", ".")         # mantém formato pedido: 7.45
+            esp_str = str(esp_float).replace(".", ",")
 
+        esp_str = esp_str.replace(",", ".")
         return f"{linhas_str}.{esp_str}"
     except Exception:
         return linhas_str
@@ -1081,17 +1082,21 @@ def higienizar_beta(df_beta):
     return df
 
 
-def obter_base_confiabilidade():
+def obter_base_confiabilidade(chassi_sel_p6):
     """
-    Usa a tabela de Peças importada na Página 1 como origem da vida média.
-    A vida base é Hectare/Proporção, com ajuste de largura quando Proporção = Máquina.
-    Depois, os modos Leve/Moderado/Extremo são aplicados sobre essa base.
+    Base para o gráfico/tela:
+    usa o chassi selecionado na Página 6 para recalcular a vida base
+    considerando a largura específica da máquina.
     """
     df_pecas_raw = st.session_state.get("df_pecas_raw")
+    df_maquinas_raw = st.session_state.get("df_maquinas_raw")
     modelo_sel = st.session_state.get("modelo_selecionado")
 
     if df_pecas_raw is None or df_pecas_raw.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), None
+
+    if df_maquinas_raw is None or df_maquinas_raw.empty:
+        return pd.DataFrame(), None
 
     df = higienizar_pecas(df_pecas_raw).copy()
 
@@ -1099,14 +1104,30 @@ def obter_base_confiabilidade():
         df = df[df["Modelo"] == modelo_sel].copy()
 
     if df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), None
+
+    dfm = higienizar_maquinas(df_maquinas_raw).copy()
+    if modelo_sel and "Modelo" in dfm.columns:
+        dfm = dfm[dfm["Modelo"] == modelo_sel].copy()
+
+    if dfm.empty:
+        return pd.DataFrame(), None
+
+    dfm["Chassi"] = dfm["Chassi"].astype(str)
+    row_maq = dfm[dfm["Chassi"] == str(chassi_sel_p6)]
+    if row_maq.empty:
+        return pd.DataFrame(), None
+    row_maq = row_maq.iloc[0]
 
     largura_ref = st.session_state.get("largura_ref_m") or 0.0
-    resumo_ref = st.session_state.get("resumo_maquina_ref") or {}
-    largura_maquina_ref = float(resumo_ref.get("largura_maquina_m", 0.0) or 0.0)
 
-    if largura_ref and largura_maquina_ref:
-        fator_largura = largura_maquina_ref / largura_ref
+    try:
+        largura_maquina = (float(row_maq["Linhas"]) * float(row_maq["Espaçamento"])) / 100.0
+    except Exception:
+        largura_maquina = 0.0
+
+    if largura_ref and largura_maquina:
+        fator_largura = largura_maquina / largura_ref
     else:
         fator_largura = 1.0
 
@@ -1124,7 +1145,6 @@ def obter_base_confiabilidade():
     df["mu_base"] = df.apply(_calc_base, axis=1)
     df["Código"] = df["Código"].apply(format_codigo)
 
-    # aplica ajustes de base importados/manualizados, quando existirem
     ajustes = st.session_state.get("ajustes_pecas", {})
     if isinstance(ajustes, dict) and not df.empty:
         for cod, vals in ajustes.items():
@@ -1140,34 +1160,44 @@ def obter_base_confiabilidade():
                 except Exception:
                     pass
 
+    tipo_maquina = _format_tamanho_bi(row_maq.get("Linhas"), row_maq.get("Espaçamento"))
+
     cols_keep = [c for c in ["Modelo", "Código", "Família", "Descrição", "Proporção", "Hectare/Proporção", "mu_base"] if c in df.columns]
     df = df[cols_keep].copy()
     df = df.dropna(subset=["Código", "mu_base"])
     df = df[df["mu_base"] > 0].copy()
     df = df.drop_duplicates(subset=["Código"], keep="first").reset_index(drop=True)
-    return df
+
+    info_maquina = {
+        "Modelo": row_maq.get("Modelo", ""),
+        "Chassi": str(row_maq.get("Chassi", "")),
+        "Linhas": row_maq.get("Linhas", ""),
+        "Espaçamento": row_maq.get("Espaçamento", ""),
+        "Ano": format_ano(row_maq.get("Ano", "")),
+        "Estado": row_maq.get("Estado", "Novo"),
+        "Tipo máquina": tipo_maquina,
+        "largura_maquina_m": largura_maquina,
+    }
+
+    return df, info_maquina
 
 
-def montar_base_confiabilidade(df_beta):
+def montar_base_confiabilidade(df_beta, chassi_sel_p6):
     """
-    Retorna:
-    1) df_relatorio -> base completa com descrição (para gráfico e conferência)
-    2) df_export -> base enxuta para exportação/BI:
-       Modelo, Modo operação, Código, R(t), Hectare, Eta, Beta
+    Base do gráfico e análise em tela para o chassi selecionado.
     """
     if df_beta is None or df_beta.empty:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), None
 
-    df_base = obter_base_confiabilidade()
-    if df_base.empty:
-        return pd.DataFrame(), pd.DataFrame()
+    df_base, info_maquina = obter_base_confiabilidade(chassi_sel_p6)
+    if df_base.empty or info_maquina is None:
+        return pd.DataFrame(), pd.DataFrame(), None
 
     df_beta = higienizar_beta(df_beta)
-
     df_merge = df_base.merge(df_beta[["Código", "Beta"]], on="Código", how="inner")
 
     if df_merge.empty:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), info_maquina
 
     modos = ["Leve", "Moderado", "Extremo"]
     linhas_out = []
@@ -1185,7 +1215,6 @@ def montar_base_confiabilidade(df_beta):
         if beta <= 0 or mu_base <= 0:
             continue
 
-        # malha comum por código, baseada no Moderado
         mu_moderado = aplicar_modo_operacao(mu_base, "Moderado")
         hectare_max = 2.0 * mu_moderado
         passo = hectare_max / 10.0
@@ -1209,6 +1238,7 @@ def montar_base_confiabilidade(df_beta):
 
                 linhas_out.append({
                     "Modelo": modelo,
+                    "Tipo máquina": info_maquina["Tipo máquina"],
                     "Modo operação": modo,
                     "Código": codigo,
                     "Descrição": descricao,
@@ -1220,15 +1250,71 @@ def montar_base_confiabilidade(df_beta):
 
     df_rel = pd.DataFrame(linhas_out)
     if df_rel.empty:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), info_maquina
 
     ordem_modo = {"Leve": 1, "Moderado": 2, "Extremo": 3}
     df_rel["__ord_modo"] = df_rel["Modo operação"].map(ordem_modo).fillna(999)
     df_rel = df_rel.sort_values(["Código", "Hectare", "__ord_modo"]).reset_index(drop=True)
     df_rel = df_rel.drop(columns=["__ord_modo"])
 
-    df_export = df_rel[["Modelo", "Modo operação", "Código", "R(t)", "Hectare", "Eta", "Beta"]].copy()
-    return df_rel, df_export
+    df_export = df_rel[["Modelo", "Tipo máquina", "Modo operação", "Código", "R(t)", "Hectare", "Eta", "Beta"]].copy()
+    return df_rel, df_export, info_maquina
+
+
+def montar_base_confiabilidade_todas_variantes(df_beta):
+    """
+    Gera a base exportável com todas as variantes disponíveis do modelo selecionado,
+    independentemente do chassi escolhido na tela.
+    """
+    if df_beta is None or df_beta.empty:
+        return pd.DataFrame()
+
+    df_maqs = st.session_state.get("df_maquinas_raw")
+    modelo_sel = st.session_state.get("modelo_selecionado")
+
+    if df_maqs is None or df_maqs.empty or not modelo_sel:
+        return pd.DataFrame()
+
+    df_maqs = higienizar_maquinas(df_maqs).copy()
+    df_maqs = df_maqs[df_maqs["Modelo"] == modelo_sel].copy()
+
+    if df_maqs.empty:
+        return pd.DataFrame()
+
+    df_maqs["Chassi"] = df_maqs["Chassi"].astype(str)
+
+    blocos = []
+
+    for chassi in sorted(df_maqs["Chassi"].unique().tolist()):
+        df_rel, df_export_chassi, info_maquina = montar_base_confiabilidade(df_beta, chassi)
+
+        if df_export_chassi is None or df_export_chassi.empty or info_maquina is None:
+            continue
+
+        blocos.append(df_export_chassi)
+
+    if not blocos:
+        return pd.DataFrame()
+
+    df_export = pd.concat(blocos, ignore_index=True)
+
+    ordem_modo = {"Leve": 1, "Moderado": 2, "Extremo": 3}
+    df_export["__ord_modo"] = df_export["Modo operação"].map(ordem_modo).fillna(999)
+
+    df_export = df_export.sort_values(
+        by=["Modelo", "Tipo máquina", "Código", "Hectare", "__ord_modo"],
+        ascending=[True, True, True, True, True]
+    ).reset_index(drop=True)
+
+    df_export = df_export.drop(columns=["__ord_modo"])
+
+    # remove duplicidade por tipo de máquina quando houver mais de um chassi com mesma configuração
+    df_export = df_export.drop_duplicates(
+        subset=["Modelo", "Tipo máquina", "Modo operação", "Código", "Hectare", "Eta", "Beta", "R(t)"],
+        keep="first"
+    ).reset_index(drop=True)
+
+    return df_export
 
 
 def gerar_excel_confiabilidade(df_export):
@@ -2769,134 +2855,180 @@ elif pagina == "6. Confiabilidade":
         st.session_state["df_pecas_raw"] is None
         or st.session_state["df_maquinas_raw"] is None
         or st.session_state["modelo_selecionado"] is None
-        or st.session_state["resumo_maquina_ref"] is None
     ):
         st.warning("Primeiro carregue os dados e processe a Página 1.")
     else:
-        st.subheader("Importar tabela de Beta (.xlsx)")
-        beta_file = st.file_uploader(
-            "Planilha Beta com colunas: Código, Família, Descrição, Beta",
-            type=["xlsx"],
-            key="upload_beta_xlsx"
-        )
+        df_maqs = higienizar_maquinas(st.session_state["df_maquinas_raw"]).copy()
+        modelo_sel = st.session_state.get("modelo_selecionado")
 
-        if beta_file is not None:
-            try:
-                st.session_state["df_beta_raw"] = pd.read_excel(beta_file)
-                st.session_state["beta_import_filename"] = beta_file.name
-            except Exception as e:
-                st.error(f"Falha ao ler a planilha Beta: {e}")
-                st.session_state["df_beta_raw"] = None
+        if modelo_sel and "Modelo" in df_maqs.columns:
+            df_maqs = df_maqs[df_maqs["Modelo"] == modelo_sel].copy()
 
-        df_beta_raw = st.session_state.get("df_beta_raw")
-
-        if df_beta_raw is None or df_beta_raw.empty:
-            st.info("Importe a planilha de Beta para habilitar o gráfico e a exportação.")
+        if df_maqs.empty:
+            st.warning("Não há máquinas disponíveis para o modelo selecionado.")
         else:
-            try:
-                df_beta = higienizar_beta(df_beta_raw)
-            except Exception as e:
-                st.error(f"Erro na planilha Beta: {e}")
-                st.stop()
+            df_maqs["Chassi"] = df_maqs["Chassi"].astype(str)
 
-            df_rel, df_export = montar_base_confiabilidade(df_beta)
+            chassis_opcoes_p6 = df_maqs["Chassi"].sort_values().unique().tolist()
 
-            if df_rel.empty:
-                st.warning("Nenhum código da planilha Beta encontrou correspondência na base de peças do modelo selecionado.")
+            if st.session_state.get("confiab_chassi_selecionado") not in chassis_opcoes_p6:
+                st.session_state["confiab_chassi_selecionado"] = chassis_opcoes_p6[0]
+
+            st.subheader("Selecionar chassi")
+            st.session_state["confiab_chassi_selecionado"] = st.selectbox(
+                "Chassi para análise de confiabilidade",
+                chassis_opcoes_p6,
+                index=chassis_opcoes_p6.index(st.session_state["confiab_chassi_selecionado"])
+            )
+
+            chassi_sel_p6 = st.session_state["confiab_chassi_selecionado"]
+
+            row_maq = df_maqs[df_maqs["Chassi"] == str(chassi_sel_p6)].iloc[0]
+
+            df_info = pd.DataFrame([{
+                "Modelo": row_maq.get("Modelo", ""),
+                "Chassi": str(row_maq.get("Chassi", "")),
+                "Linhas": row_maq.get("Linhas", ""),
+                "Espaçamento": row_maq.get("Espaçamento", ""),
+                "Ano": format_ano(row_maq.get("Ano", "")),
+                "Estado": row_maq.get("Estado", "Novo"),
+            }])
+
+            st.subheader("Informações do chassi selecionado")
+            st.dataframe(df_info, use_container_width=True, hide_index=True)
+
+            st.markdown("---")
+            st.subheader("Importar tabela de Beta (.xlsx)")
+            beta_file = st.file_uploader(
+                "Planilha Beta com colunas: Código, Família, Descrição, Beta",
+                type=["xlsx"],
+                key="upload_beta_xlsx"
+            )
+
+            if beta_file is not None:
+                try:
+                    st.session_state["df_beta_raw"] = pd.read_excel(beta_file)
+                    st.session_state["beta_import_filename"] = beta_file.name
+                except Exception as e:
+                    st.error(f"Falha ao ler a planilha Beta: {e}")
+                    st.session_state["df_beta_raw"] = None
+
+            df_beta_raw = st.session_state.get("df_beta_raw")
+
+            if df_beta_raw is None or df_beta_raw.empty:
+                st.info("Importe a planilha de Beta para habilitar o gráfico e a exportação.")
             else:
-                st.success(f"Base de confiabilidade gerada com {len(df_export):,} linhas.".replace(",", "."))
+                try:
+                    df_beta = higienizar_beta(df_beta_raw)
+                except Exception as e:
+                    st.error(f"Erro na planilha Beta: {e}")
+                    st.stop()
 
-                # ---------
-                # Filtro por código
-                # ---------
-                codigos_disp = (
-                    df_rel[["Código", "Descrição"]]
-                    .drop_duplicates()
-                    .sort_values(["Código", "Descrição"])
-                    .reset_index(drop=True)
-                )
+                # Base para gráfico (apenas chassi selecionado)
+                df_rel, df_export_grafico, info_maquina = montar_base_confiabilidade(df_beta, chassi_sel_p6)
 
-                opcoes_codigo = codigos_disp["Código"].tolist()
+                # Base completa para exportação (todas as variantes do modelo)
+                df_export_todas = montar_base_confiabilidade_todas_variantes(df_beta)
 
-                if st.session_state.get("codigo_confiabilidade_sel") not in opcoes_codigo:
-                    st.session_state["codigo_confiabilidade_sel"] = opcoes_codigo[0]
-
-                codigo_sel = st.selectbox(
-                    "Selecione o código para visualizar a curva R(t)",
-                    opcoes_codigo,
-                    index=opcoes_codigo.index(st.session_state["codigo_confiabilidade_sel"])
-                )
-                st.session_state["codigo_confiabilidade_sel"] = codigo_sel
-
-                df_plot = df_rel[df_rel["Código"] == codigo_sel].copy()
-
-                descricao_sel = ""
-                if not df_plot.empty and "Descrição" in df_plot.columns:
-                    descricao_sel = str(df_plot["Descrição"].dropna().iloc[0]) if not df_plot["Descrição"].dropna().empty else ""
-
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.write(f"**Código:** {codigo_sel}")
-                with c2:
-                    st.write(f"**Descrição:** {descricao_sel if descricao_sel else '-'}")
-
-                # ---------
-                # Gráfico R(t)
-                # ---------
-                st.markdown("### Curva de confiabilidade R(t)")
-
-                ordem_modo = ["Leve", "Moderado", "Extremo"]
-                df_plot["Modo operação"] = pd.Categorical(df_plot["Modo operação"], categories=ordem_modo, ordered=True)
-                df_plot = df_plot.sort_values(["Modo operação", "Hectare"]).reset_index(drop=True)
-
-                graf = (
-                    alt.Chart(df_plot)
-                    .mark_line()
-                    .encode(
-                        x=alt.X("Hectare:Q", title="Hectare"),
-                        y=alt.Y("R(t):Q", title="Confiabilidade R(t)", scale=alt.Scale(domain=[0, 1.05])),
-                        color=alt.Color("Modo operação:N", title="Modo operação"),
-                        tooltip=[
-                            alt.Tooltip("Código:N", title="Código"),
-                            alt.Tooltip("Descrição:N", title="Descrição"),
-                            alt.Tooltip("Modo operação:N", title="Modo"),
-                            alt.Tooltip("Hectare:Q", title="Hectare", format=".2f"),
-                            alt.Tooltip("R(t):Q", title="R(t)", format=".6f"),
-                            alt.Tooltip("Eta:Q", title="Eta", format=".4f"),
-                            alt.Tooltip("Beta:Q", title="Beta", format=".4f"),
-                        ]
+                if info_maquina is not None:
+                    st.caption(
+                        f"Tipo máquina do chassi selecionado: {info_maquina['Tipo máquina']} "
+                        f"(largura ≈ {info_maquina['largura_maquina_m']:.2f} m)"
                     )
-                    .properties(height=420)
-                    .interactive()
-                )
 
-                st.altair_chart(graf, use_container_width=True)
+                if df_rel.empty:
+                    st.warning("Nenhum código da planilha Beta encontrou correspondência na base de peças do chassi selecionado.")
+                elif df_export_todas.empty:
+                    st.warning("Não foi possível gerar a base exportável com as variantes do modelo.")
+                else:
+                    st.success(
+                        f"Gráfico carregado para o chassi selecionado e base completa gerada com {len(df_export_todas):,} linhas."
+                        .replace(",", ".")
+                    )
 
-                # ---------
-                # Prévia da base exportável
-                # ---------
-                st.markdown("### Prévia da base exportável")
-                st.dataframe(
-                    df_export.head(50),
-                    hide_index=True,
-                    use_container_width=True,
-                    column_config={
-                        "Modelo": st.column_config.TextColumn("Modelo"),
-                        "Modo operação": st.column_config.TextColumn("Modo operação"),
-                        "Código": st.column_config.TextColumn("Código"),
-                        "R(t)": st.column_config.NumberColumn("R(t)", format="%.6f"),
-                        "Hectare": st.column_config.NumberColumn("Hectare", format="%.2f"),
-                        "Eta": st.column_config.NumberColumn("Eta", format="%.4f"),
-                        "Beta": st.column_config.NumberColumn("Beta", format="%.4f"),
-                    }
-                )
+                    codigos_disp = (
+                        df_rel[["Código", "Descrição"]]
+                        .drop_duplicates()
+                        .sort_values(["Código", "Descrição"])
+                        .reset_index(drop=True)
+                    )
 
-                buffer_conf = gerar_excel_confiabilidade(df_export)
+                    opcoes_codigo = codigos_disp["Código"].tolist()
 
-                st.download_button(
-                    label="⬇️ Exportar base de confiabilidade (.xlsx)",
-                    data=buffer_conf,
-                    file_name="base_confiabilidade_weibull.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
+                    if st.session_state.get("codigo_confiabilidade_sel") not in opcoes_codigo:
+                        st.session_state["codigo_confiabilidade_sel"] = opcoes_codigo[0]
+
+                    codigo_sel = st.selectbox(
+                        "Selecione o código para visualizar a curva R(t)",
+                        opcoes_codigo,
+                        index=opcoes_codigo.index(st.session_state["codigo_confiabilidade_sel"])
+                    )
+                    st.session_state["codigo_confiabilidade_sel"] = codigo_sel
+
+                    df_plot = df_rel[df_rel["Código"] == codigo_sel].copy()
+
+                    descricao_sel = ""
+                    if not df_plot.empty and "Descrição" in df_plot.columns:
+                        descricao_sel = str(df_plot["Descrição"].dropna().iloc[0]) if not df_plot["Descrição"].dropna().empty else ""
+
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.write(f"**Código:** {codigo_sel}")
+                    with c2:
+                        st.write(f"**Descrição:** {descricao_sel if descricao_sel else '-'}")
+
+                    st.markdown("### Curva de confiabilidade R(t)")
+
+                    ordem_modo = ["Leve", "Moderado", "Extremo"]
+                    df_plot["Modo operação"] = pd.Categorical(df_plot["Modo operação"], categories=ordem_modo, ordered=True)
+                    df_plot = df_plot.sort_values(["Modo operação", "Hectare"]).reset_index(drop=True)
+
+                    graf = (
+                        alt.Chart(df_plot)
+                        .mark_line()
+                        .encode(
+                            x=alt.X("Hectare:Q", title="Hectare"),
+                            y=alt.Y("R(t):Q", title="Confiabilidade R(t)", scale=alt.Scale(domain=[0, 1.05])),
+                            color=alt.Color("Modo operação:N", title="Modo operação"),
+                            tooltip=[
+                                alt.Tooltip("Código:N", title="Código"),
+                                alt.Tooltip("Descrição:N", title="Descrição"),
+                                alt.Tooltip("Modo operação:N", title="Modo"),
+                                alt.Tooltip("Hectare:Q", title="Hectare", format=".2f"),
+                                alt.Tooltip("R(t):Q", title="R(t)", format=".6f"),
+                                alt.Tooltip("Eta:Q", title="Eta", format=".4f"),
+                                alt.Tooltip("Beta:Q", title="Beta", format=".4f"),
+                            ]
+                        )
+                        .properties(height=420)
+                        .interactive()
+                    )
+
+                    st.altair_chart(graf, use_container_width=True)
+
+                    st.markdown("### Prévia da base exportável")
+                    st.dataframe(
+                        df_export_todas.head(50),
+                        hide_index=True,
+                        use_container_width=True,
+                        column_config={
+                            "Modelo": st.column_config.TextColumn("Modelo"),
+                            "Tipo máquina": st.column_config.TextColumn("Tipo máquina"),
+                            "Modo operação": st.column_config.TextColumn("Modo operação"),
+                            "Código": st.column_config.TextColumn("Código"),
+                            "R(t)": st.column_config.NumberColumn("R(t)", format="%.6f"),
+                            "Hectare": st.column_config.NumberColumn("Hectare", format="%.2f"),
+                            "Eta": st.column_config.NumberColumn("Eta", format="%.4f"),
+                            "Beta": st.column_config.NumberColumn("Beta", format="%.4f"),
+                        }
+                    )
+
+                    buffer_conf = gerar_excel_confiabilidade(df_export_todas)
+
+                    st.download_button(
+                        label="⬇️ Exportar base de confiabilidade (.xlsx)",
+                        data=buffer_conf,
+                        file_name=f"base_confiabilidade_modelo_{st.session_state['modelo_selecionado']}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
